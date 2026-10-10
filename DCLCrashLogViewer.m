@@ -18,6 +18,19 @@
 #import "DCLCrashReporter.h"
 #import "DCLConstants.h"
 
+// 私有类目前置声明：主页面 VC（DCLLogMasterVC）定义在 @implementation DCLCrashLogViewer
+// 之前，若不提前声明这些类方法，编译期会报
+// "no known class method for selector 'xxx'"。
+@interface DCLCrashLogViewer (Private)
++ (NSArray<NSString *> *)sortedLogNames;
++ (void)presentDetailWithName:(NSString *)name from:(UIViewController *)top;
++ (void)presentRuntimeDetailFrom:(UIViewController *)top;
++ (void)clearAll;
++ (void)buildCombinedText:(void (^)(NSString *text))completion;
++ (NSString *)dcl_readFileCapped:(NSString *)path maxBytes:(NSUInteger)maxBytes;
++ (NSString *)dcl_readFileTail:(NSString *)path maxBytes:(NSUInteger)maxBytes;
+@end
+
 #pragma mark - 辅助：找到最上层 presented VC
 
 static UIViewController *dcl_top_view_controller(UIViewController *root) {
