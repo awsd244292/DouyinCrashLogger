@@ -5,14 +5,17 @@
 //  入口设计：
 //  1) 崩溃捕获（signal / UncaughtException）必须在 dylib 加载早期安装，不能延迟，
 //     否则启动阶段的崩溃抓不到。
-//  2) UI 入口（设置页按钮 + 摇一摇）延迟到主 runloop 起来后再交换，遵循“加载阶段
-//     不早 hook / 不早执行业务逻辑”的防闪退原则。
+//  2) 退出标记（recordExitMark...）同样在 constructor 早期执行：先读取上一轮退出标记
+//     供 UI 判断“疑似闪退”，并注册 WillTerminate 观察者。
+//  3) UI 入口（设置页按钮）与 stderr 重定向（freopen）延迟到主 runloop 起来后再执行，
+//     遵循“加载阶段不早 hook / 不早执行业务逻辑 / freopen 不在 constructor 阶段”的防闪退原则。
 //
 //  防闪退要点（遵循注入规范）：
 //  - 不 Hook 抖音任何私有类/方法；只交换 UIViewController（系统公开类）的
 //    -viewWillAppear:，再用 title 识别“设置”页，最大限度降低与抖音内部实现的耦合。
 //  - 进程过滤（bundle id）、类/方法存在性检查、isKindOfClass、判空、主线程、@try/@catch。
 //  - 全程 Objective-C runtime 原生 API（method_setImplementation），不依赖 CydiaSubstrate。
+//  - 入口只放在抖音“设置”页右上角按钮，移除摇一摇（避免与抖音自身摇一摇冲突）。
 //
 
 #import <UIKit/UIKit.h>
@@ -37,7 +40,6 @@ static DCLLogOpener *g_opener = nil;
 #pragma mark - 原始实现指针
 
 static void (*orig_viewWillAppear)(UIViewController *, SEL, BOOL) = NULL;
-static void (*orig_sendEvent)(UIApplication *, SEL, UIEvent *) = NULL;
 
 static const void *kDCLButtonAdded = &kDCLButtonAdded;
 
@@ -100,23 +102,6 @@ static void dcl_viewWillAppear(UIViewController *self, SEL _cmd, BOOL animated) 
     }
 }
 
-static void dcl_sendEvent(UIApplication *self, SEL _cmd, UIEvent *event) {
-    if (event && event.type == UIEventTypeMotion &&
-        event.subtype == UIEventSubtypeMotionShake) {
-        static NSTimeInterval lastTrigger = 0;
-        NSTimeInterval now = NSDate.timeIntervalSinceReferenceDate;
-        if (now - lastTrigger > DCLShakeDebounceInterval) {
-            lastTrigger = now;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [DCLCrashLogViewer present];
-            });
-        }
-    }
-    if (orig_sendEvent) {
-        orig_sendEvent(self, _cmd, event);
-    }
-}
-
 #pragma mark - 入口注册（延迟到主 runloop 后执行，避免注入早期闪退）
 
 static void dcl_register_ui_entry(void) {
@@ -129,15 +114,11 @@ static void dcl_register_ui_entry(void) {
             orig_viewWillAppear = (void *)method_getImplementation(m);
             method_setImplementation(m, (IMP)dcl_viewWillAppear);
         }
-        // 摇一摇入口（备选）：交换 UIApplication -sendEvent:
-        Class appCls = [UIApplication class];
-        SEL se = @selector(sendEvent:);
-        Method m2 = class_getInstanceMethod(appCls, se);
-        if (m2) {
-            orig_sendEvent = (void *)method_getImplementation(m2);
-            method_setImplementation(m2, (IMP)dcl_sendEvent);
-        }
         if (!g_opener) g_opener = [[DCLLogOpener alloc] init];
+
+        // stderr/stdout 重定向到沙盒 runtime 日志：必须在延迟块执行，
+        // 绝不可放在 constructor / +load 阶段（freopen 过早会拖慢/影响注入稳定性）。
+        [DCLCrashReporter redirectStderrToRuntimeLog];
     } @catch (id e) {
         (void)e;
     }
@@ -148,7 +129,11 @@ __attribute__((constructor)) static void dcl_entry(void) {
     [DCLCrashReporter install];
     [DCLCrashReporter cleanupOldLogs];
 
-    // 2) UI 入口延迟 1s，等 App 主 runloop 跑起来、视图引擎就绪后再交换，
+    // 2) 退出标记：读取上一轮“是否正常退出”供 UI 判定疑似闪退，并注册
+    //    WillTerminate 观察者；SIGKILL/OOM 不会触发该通知，因此只能标记“疑似”。
+    [DCLCrashReporter recordExitMarkAndRegisterTerminateObserver];
+
+    // 3) UI 入口延迟 1s，等 App 主 runloop 跑起来、视图引擎就绪后再交换，
     //    避免注入早期直接闪退。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{

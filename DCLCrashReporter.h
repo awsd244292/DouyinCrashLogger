@@ -29,6 +29,27 @@ NS_ASSUME_NONNULL_BEGIN
 /// 崩溃日志目录（App 沙盒内，绝对路径）。
 + (NSString *)crashLogsDirectory;
 
+/// 启动期调用：读取「上次是否正常退出」标记，并注册 WillTerminate 观察者写回正常标记。
+/// 注意：SIGKILL / Jetsam(OOM) 不会触发 WillTerminate，因此只能标记出
+/// 「疑似闪退（无 ips 日志）」，拿不到内核级原因（需 sysdiagnose）。
++ (void)recordExitMarkAndRegisterTerminateObserver;
+
+/// 延迟块中调用：把 stderr 重定向到沙盒 runtime 日志（plugin_runtime.log），
+/// 即使随后被 SIGKILL，被杀前已落盘的 stderr 也可作为排查线索（末尾可能丢失）。
++ (void)redirectStderrToRuntimeLog;
+
+/// 上次退出是否异常（YES = 疑似 SIGKILL/Jetsam 闪退，无 ips）
++ (BOOL)lastExitWasAbnormal;
+
+/// 是否首次运行（无历史退出标记）
++ (BOOL)firstLaunchEver;
+
+/// 上次正常退出的时间（无记录返回 nil）
++ (nullable NSDate *)lastNormalExitDate;
+
+/// 运行时 stderr 日志的完整路径
++ (NSString *)runtimeLogPath;
+
 @end
 
 NS_ASSUME_NONNULL_END

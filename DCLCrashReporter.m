@@ -35,6 +35,11 @@ static char g_tmpPath[2048] = {0};       // 当前正在写入的日志路径（
 static char g_image_table[262144] = {0};
 static uint32_t g_image_count = 0;
 
+// 退出标记相关（非崩溃上下文读写，供 UI 展示“上次退出状态”）
+static BOOL g_prev_exit_normal = NO;   // 上一轮启动时的“正常退出”标记
+static BOOL g_first_launch = YES;      // 是否从未写过退出标记（首次运行）
+static NSDate *g_last_normal_exit_date = nil; // 上一轮正常退出的时间
+
 #pragma mark - 小工具（async-signal-safe）
 
 static const char *dcl_signal_name(int sig) {
@@ -308,6 +313,101 @@ static void dcl_prepare_meta(void) {
     dcl_prepare_images();
     dcl_install_signals();
     NSSetUncaughtExceptionHandler(&dcl_uncaught_exception_handler);
+}
+
+#pragma mark - 退出标记 / 运行时日志
+
++ (NSString *)runtimeLogPath {
+    return [[self crashLogsDirectory] stringByAppendingPathComponent:DCLRuntimeLogFileName];
+}
+
++ (void)recordExitMarkAndRegisterTerminateObserver {
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        id val = [ud objectForKey:DCLLastExitNormalKey];
+        if (val == nil) {
+            // 没有任何历史退出标记：视为首次运行
+            g_first_launch = YES;
+            g_prev_exit_normal = NO;
+        } else {
+            g_first_launch = NO;
+            g_prev_exit_normal = [val boolValue];
+        }
+
+        // 上一轮正常退出的时间戳（由上一轮的 WillTerminate 写入）
+        id t = [ud objectForKey:DCLLastNormalExitTimeKey];
+        if ([t isKindOfClass:[NSNumber class]]) {
+            g_last_normal_exit_date = [NSDate dateWithTimeIntervalSince1970:[t doubleValue]];
+        }
+
+        // 关键：先把“本次尚未正常终止”写回 NO。若随后进程被 SIGKILL / OOM / 崩溃，
+        // 不会触发 WillTerminate，下一轮启动读到 NO 即判定为“疑似闪退（无 ips）”。
+        [ud setObject:@(NO) forKey:DCLLastExitNormalKey];
+        [ud synchronize];
+
+        // 注册标准终止观察者：只有走正常退出流程才会触发，写回 YES + 时间戳。
+        // 观察者挂在类对象（元类，进程生命周期内常驻）上，无需额外持有 token。
+        [[NSNotificationCenter defaultCenter]
+            addObserver:self
+               selector:@selector(dcl_appWillTerminate:)
+                   name:UIApplicationWillTerminateNotification
+                 object:nil];
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
++ (void)dcl_appWillTerminate:(NSNotification *)note {
+    @try {
+        NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+        [u setObject:@(YES) forKey:DCLLastExitNormalKey];
+        [u setObject:@([[NSDate date] timeIntervalSince1970]) forKey:DCLLastNormalExitTimeKey];
+        [u synchronize];
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
++ (BOOL)lastExitWasAbnormal {
+    // 非首次运行 且 上一轮未正常退出
+    return (!g_first_launch) && (!g_prev_exit_normal);
+}
+
++ (BOOL)firstLaunchEver {
+    return g_first_launch;
+}
+
++ (nullable NSDate *)lastNormalExitDate {
+    return g_last_normal_exit_date;
+}
+
++ (void)redirectStderrToRuntimeLog {
+    @try {
+        NSString *dir = [self crashLogsDirectory];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:nil];
+        NSString *path = [self runtimeLogPath];
+
+        // 把 stderr / stdout 重定向到沙盒 runtime 日志。即便随后被 SIGKILL，
+        // 被杀前已经落盘的部分仍可作为排查线索（末尾可能丢失）。
+        // 注意：freopen 必须在“延迟块”里执行，绝不能放在 constructor / +load 阶段，
+        // 否则可能影响注入早期稳定性。
+        FILE *fe = freopen([path UTF8String], "a+", stderr);
+        (void)fe;
+        FILE *fo = freopen([path UTF8String], "a+", stdout);
+        (void)fo;
+
+        // 立即落一行启动标记，便于区分每次运行
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        fprintf(stderr, "\n--- [DCL] runtime log attached @ %lld.%06lld ---\n",
+                (long long)tv.tv_sec, (long long)tv.tv_usec);
+        fflush(stderr);
+    } @catch (id e) {
+        (void)e;
+    }
 }
 
 @end

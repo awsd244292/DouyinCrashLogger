@@ -14,7 +14,7 @@
   - Objective-C 未捕获异常（`NSUncaughtException`）
   - 记录：设备型号、系统版本、抖音包名/版本、**崩溃类型与原因**、故障地址、崩溃线程回溯
 - 📂 **日志落盘**：写入抖音沙盒 `Documents/DouyinCrashLogs/`，按时间命名，自动保留最近 20 条
-- 📲 **查看与导出**：进入抖音「设置」页 → 点右上角 **📋 崩溃日志** 按钮（或在抖音内**摇一摇**也可）→ 弹出日志列表 → 点开看详情 → 可一键分享 / 保存 / 清除
+- 📲 **查看与导出**：进入抖音「设置」页 → 点右上角 **📋 崩溃日志** 按钮 → 打开**独立日志查看页** → 看退出状态 / 崩溃记录 / 运行时日志 → 可一键复制全部 / 导出 / 清空
 - 🪶 **双保险**：自定义日志之外，仍会重新触发默认信号，由系统生成标准 crash report
 
 ---
@@ -25,7 +25,8 @@
 |---|---|---|
 | 崩溃捕获 | `signal()` / `sigaction()`（POSIX）+ `NSSetUncaughtExceptionHandler` | ❌ 否 |
 | 设置页入口 | 交换 `UIViewController -viewWillAppear:`（系统类，非抖音私有），用 `title` 命中“设置”页后追加 `UIBarButtonItem` | ❌ 否 |
-| 摇一摇入口（备选） | 原生交换 `UIApplication -sendEvent:` | ❌ 否 |
+| 退出状态标记 | `NSUserDefaults` 记录上次是否走 `WillTerminate` 正常退出 + 注册终止观察者 | ❌ 否 |
+| 运行时日志 | 延迟块内 `freopen` 把 `stderr/stdout` 重定向到沙盒 `plugin_runtime.log` | ❌ 否 |
 | 日志写入 | 信号处理路径使用 `open/write/fsync/close`（async-signal-safe） | ❌ 否 |
 
 > 全程不使用 Logos `%hook`（那会引入 `_MSHookMessageEx` 等需要 substrate 的符号）。
@@ -41,7 +42,7 @@
 **方式 A — TrollStore（巨魔，推荐）**
 1. 安装 TrollStore + [TrollFools](https://github.com/Lessica/TrollFools)
 2. TrollFools → 选**抖音** → 注入 `DouyinCrashLogger.dylib` → 自动重装
-3. 打开抖音，进入「设置」页，点右上角 **📋 崩溃日志** 即可看到日志（也可摇一摇触发）
+3. 打开抖音，进入「设置」页，点右上角 **📋 崩溃日志** 即可打开独立日志查看页
 
 **方式 B — 普通自签（AltStore / Sideloadly / Esign）**
 1. 准备抖音砸壳 IPA
@@ -71,6 +72,27 @@
 > ```
 > OC 异常路径（`NSException`）则直接记录 `callStackSymbols`，可读性更好。
 
+## 为什么有时「闪退但 0 条记录」
+
+抖音真正“闪退”时，本插件可能**抓不到**任何崩溃日志，这是平台限制而非 bug：
+
+- **`SIGKILL`（信号 9）/ 内存溢出（Jetsam/OOM）**：无法被任何信号处理器捕获，也不产生 ips 日志；
+- **Mach-O 加载极早期崩溃**：dylib 还没来得及安装 handler 就挂了；
+- **系统 Analytics 的 ips 与 App 沙盒隔离**：系统级崩溃报告插件读不到。
+
+为此本插件提供两条**兜底线索**，都在独立日志页里展示：
+
+1. **上次退出状态标记**
+   - 启动时读 `NSUserDefaults` 里上一轮「是否正常退出」的标记；同时注册 `UIApplicationWillTerminateNotification` 观察者。
+   - 若进程被 `SIGKILL` / OOM / 早期崩溃杀掉，**不会**触发 WillTerminate，下一轮启动即判定为「**疑似闪退（无 ips 日志）**」；
+   - 正常退出时观察者写回「正常」+ 时间戳。
+   - 注意：这只能量化“疑似”，拿不到内核级原因，深度定位需用 `sysdiagnose`。
+2. **运行时日志（`plugin_runtime.log`）**
+   - 在延迟块（主 runloop 起来后）用 `freopen` 把 `stderr/stdout` 重定向到沙盒文件。
+   - 即使随后被 `SIGKILL`，被杀前已经落盘的部分仍可看出崩溃前的最后输出（末尾可能丢失）。
+
+> `freopen` **必须**放在延迟块，**绝不能**放在 `constructor` / `+load` 阶段，否则会拖慢甚至影响注入早期稳定性。
+
 ## 隐私说明（重要）
 
 - 日志**仅保存在本机沙盒**，**绝不自动上传**；UI 内“分享/导出”需你**手动触发**。
@@ -80,7 +102,7 @@
 ## 日志导出
 
 - **直接取文件**：日志在抖音沙盒 `Documents/DouyinCrashLogs/`，可用 Filza 或自签工具导出 App 容器取出
-- **设置页入口 / 摇一摇**：列表 → 点开详情 → 右上角分享按钮 / 「全部导出」用系统分享（微信、备忘录、文件 App 等）
+- **设置页入口**：打开独立日志页 → 底部工具栏「复制全部」（复制到剪贴板）/「导出」（合并成单文件用系统分享，微信、备忘录、文件 App 等）/「清空」
 
 ---
 
