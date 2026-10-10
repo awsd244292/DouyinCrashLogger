@@ -74,7 +74,7 @@ if [[ "${#dylib_paths[@]}" -ne 1 ]]; then
 fi
 
 mkdir -p "$output_dir"
-output_file="${output_dir}/DYYY_${package_version}.dylib"
+output_file="${output_dir}/${tweak_dylib_name%.dylib}_${package_version}.dylib"
 cp "${dylib_paths[0]}" "$output_file"
 
 if command -v lipo >/dev/null 2>&1; then

@@ -11,7 +11,8 @@
 #import <UIKit/UIKit.h>
 #import <sys/signal.h>
 #import <execinfo.h>
-#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <sys/sysctl.h>
 #import <sys/time.h>
 #import <unistd.h>
@@ -28,6 +29,11 @@ static int g_installed = 0;
 static char g_meta[2048] = {0};          // 设备/系统/App 版本等多行文本
 static char g_logDir[1024] = {0};        // 崩溃日志目录绝对路径（C 字符串）
 static char g_tmpPath[2048] = {0};       // 当前正在写入的日志路径（用于异常路径续写）
+
+// 启动时预收集已加载镜像（基址 + 路径）。信号处理路径只做只读 write，
+// 不调用 dladdr（非 async-signal-safe，易死锁/丢栈）。atos 符号化时据此基址表映射地址。
+static char g_image_table[262144] = {0};
+static uint32_t g_image_count = 0;
 
 #pragma mark - 小工具（async-signal-safe）
 
@@ -76,24 +82,14 @@ static int dcl_open_report_file(void) {
     return fd;
 }
 
-// 写出回溯（signal 路径）：仅 backtrace + dladdr，不调用 backtrace_symbols（避免额外 malloc）
+// 写出回溯（signal 路径）：仅记录原始地址，不调用 dladdr / backtrace_symbols。
+// dladdr 非 async-signal-safe，handler 内调用可能触发内部锁导致二次崩溃/死锁、丢栈。
+// 符号化交由用户在 macOS 上用 atos + 上方 Loaded images 基址表还原。
 static void dcl_write_backtrace(int fd, void **frames, int nframes) {
-    char line[1024];
+    char line[64];
     for (int i = 0; i < nframes; i++) {
-        Dl_info info;
-        memset(&info, 0, sizeof(info));
-        if (dladdr(frames[i], &info) && info.dli_fname) {
-            uintptr_t off = (uintptr_t)frames[i] - (uintptr_t)info.dli_saddr;
-            snprintf(line, sizeof(line),
-                     "#%-3d %s 0x%llx (offset 0x%llx)\n",
-                     i, info.dli_fname,
-                     (unsigned long long)(uintptr_t)frames[i],
-                     (unsigned long long)off);
-        } else {
-            snprintf(line, sizeof(line),
-                     "#%-3d 0x%llx\n", i,
-                     (unsigned long long)(uintptr_t)frames[i]);
-        }
+        snprintf(line, sizeof(line), "#%-3d 0x%llx\n", i,
+                 (unsigned long long)(uintptr_t)frames[i]);
         dcl_write_all(fd, line);
     }
 }
@@ -117,7 +113,9 @@ static void dcl_write_report_c(const char *type, const char *detail,
         dcl_write_all(fd, detail);
         dcl_write_all(fd, "\n");
     }
-    dcl_write_all(fd, "\n--- Backtrace (crashed thread) ---\n");
+    dcl_write_all(fd, "\n--- Loaded images (base -> module) ---\n");
+    dcl_write_all(fd, g_image_table);
+    dcl_write_all(fd, "\n--- Backtrace (crashed thread, raw addresses) ---\n");
     dcl_write_backtrace(fd, frames, nframes);
     dcl_write_all(fd, "===================================================\n");
 
@@ -179,31 +177,57 @@ static void dcl_uncaught_exception_handler(NSException *exception) {
         return;
     }
 
-    @autoreleasepool {
-        // OC 异常路径无信号重入风险，用 Foundation 写出可读性更高的报告
-        NSString *dir = [DCLCrashReporter crashLogsDirectory];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    // @try/@catch 包裹：捕获模块自身异常，避免覆盖原始崩溃栈
+    @try {
+        @autoreleasepool {
+            // OC 异常路径无信号重入风险，用 Foundation 写出可读性更高的报告
+            NSString *dir = [DCLCrashReporter crashLogsDirectory];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
 
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
 
-        NSString *meta = [NSString stringWithUTF8String:g_meta];
-        NSMutableString *report = [NSMutableString string];
-        [report appendString:@"========== DouyinCrashLogger Crash Report ==========\n"];
-        [report appendFormat:@"Time(unix): %lld.%06lld\n", (long long)tv.tv_sec, (long long)tv.tv_usec];
-        if (meta.length) [report appendString:meta];
-        [report appendFormat:@"CrashType: NSException:%@\n", exception.name ?: @"(null)"];
-        [report appendFormat:@"Detail: reason: %@\n", exception.reason ?: @"(null)"];
-        [report appendString:@"\n--- callStackSymbols ---\n"];
-        NSString *stack = [exception.callStackSymbols componentsJoinedByString:@"\n"];
-        [report appendString:(stack ?: @"(none)")];
-        [report appendString:@"\n===================================================\n"];
+            NSString *meta = [NSString stringWithUTF8String:g_meta];
+            NSMutableString *report = [NSMutableString string];
+            [report appendString:@"========== DouyinCrashLogger Crash Report ==========\n"];
+            [report appendFormat:@"Time(unix): %lld.%06lld\n", (long long)tv.tv_sec, (long long)tv.tv_usec];
+            if (meta.length) [report appendString:meta];
+            [report appendFormat:@"CrashType: NSException:%@\n", exception.name ?: @"(null)"];
+            [report appendFormat:@"Detail: reason: %@\n", exception.reason ?: @"(null)"];
+            [report appendString:@"\n--- callStackSymbols ---\n"];
+            NSString *stack = [exception.callStackSymbols componentsJoinedByString:@"\n"];
+            [report appendString:(stack ?: @"(none)")];
+            [report appendString:@"\n===================================================\n"];
 
-        NSString *fileName = [NSString stringWithFormat:@"crash_%lld_%06lld_P%d.log",
-                              (long long)tv.tv_sec, (long long)tv.tv_usec, (int)getpid()];
-        NSString *path = [dir stringByAppendingPathComponent:fileName];
-        [report writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            NSString *fileName = [NSString stringWithFormat:@"crash_%lld_%06lld_P%d.log",
+                                  (long long)tv.tv_sec, (long long)tv.tv_usec, (int)getpid()];
+            NSString *path = [dir stringByAppendingPathComponent:fileName];
+            [report writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+        }
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
+#pragma mark - 镜像基址表预收集（非崩溃上下文，供崩溃日志映射地址）
+
+// 启动时收集所有已加载镜像的基址与路径，写入 g_image_table。
+// 信号处理路径只只读该缓冲区，不调用 dladdr（非 async-signal-safe）。
+static void dcl_prepare_images(void) {
+    uint32_t cnt = _dyld_image_count();
+    g_image_count = cnt;
+    size_t off = 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        const struct mach_header *hdr = _dyld_get_image_header(i);
+        const char *name = _dyld_get_image_name(i);
+        if (!hdr || !name) continue;
+        int n = snprintf(g_image_table + off, sizeof(g_image_table) - off,
+                         "Image %u 0x%llx %s\n", i,
+                         (unsigned long long)(uintptr_t)hdr, name);
+        if (n < 0) break;
+        off += (size_t)n;
+        if (off >= sizeof(g_image_table) - 128) break;
     }
 }
 
@@ -281,6 +305,7 @@ static void dcl_prepare_meta(void) {
     strncpy(g_logDir, [dir UTF8String] ?: "", sizeof(g_logDir) - 1);
     g_logDir[sizeof(g_logDir) - 1] = '\0';
 
+    dcl_prepare_images();
     dcl_install_signals();
     NSSetUncaughtExceptionHandler(&dcl_uncaught_exception_handler);
 }

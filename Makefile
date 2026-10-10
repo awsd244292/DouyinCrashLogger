@@ -7,6 +7,10 @@ ARCHS := arm64 arm64e
 
 TWEAK_NAME := DouyinCrashLogger
 
+# 保留符号表：便于崩溃日志里回溯到插件自身的函数名（自用调试更友好）。
+# Theos 默认会 strip，置 STRIP 为 echo 使其变成空操作。
+STRIP = echo
+
 # 源文件：不使用 Logos %hook（避免引入 substrate 依赖），全部用原生 runtime 交换 + C 信号捕获
 DouyinCrashLogger_FILES := DCLMain.m DCLConstants.m DCLCrashReporter.m DCLCrashLogViewer.m
 
