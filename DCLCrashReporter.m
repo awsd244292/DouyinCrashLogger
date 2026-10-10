@@ -352,6 +352,33 @@ static void dcl_prepare_meta(void) {
                selector:@selector(dcl_appWillTerminate:)
                    name:UIApplicationWillTerminateNotification
                  object:nil];
+
+        // 把「上次退出状态」追加写入 plugin_runtime.log：
+        // 极简版没有 App 内页面，直接读容器里的文件时据此判断上次是否疑似闪退。
+        NSString *path = [self runtimeLogPath];
+        [[NSFileManager defaultManager] createDirectoryAtPath:[self crashLogsDirectory]
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:nil];
+        FILE *f = fopen([path UTF8String], "a");
+        if (f) {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            fprintf(f, "----- [DCL] launch @ %lld.%06lld -----\n",
+                    (long long)tv.tv_sec, (long long)tv.tv_usec);
+            if (g_first_launch) {
+                fprintf(f, "[DCL] 上次退出状态：首次运行（无历史记录）\n");
+            } else if (!g_prev_exit_normal) {
+                fprintf(f, "[DCL] 上次退出状态：疑似闪退（无 ips 日志，可能 SIGKILL/OOM/早期崩溃）\n");
+            } else {
+                fprintf(f, "[DCL] 上次退出状态：正常\n");
+            }
+            if (g_last_normal_exit_date) {
+                fprintf(f, "[DCL] 上次正常退出时间：%s\n",
+                        [[g_last_normal_exit_date description] UTF8String]);
+            }
+            fclose(f);
+        }
     } @catch (id e) {
         (void)e;
     }

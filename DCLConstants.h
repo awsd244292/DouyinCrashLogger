@@ -24,10 +24,4 @@ FOUNDATION_EXPORT NSString * const DCLLastNormalExitTimeKey;
 /// 运行时 stderr 重定向日志文件名（存放在崩溃日志目录下）
 FOUNDATION_EXPORT NSString * const DCLRuntimeLogFileName;
 
-/// 单条崩溃日志读入 UI 的最大字节数（避免大文件卡主线程/撑爆内存）
-FOUNDATION_EXPORT NSUInteger const DCLMaxCrashLogBytesForUI;
-
-/// 运行时日志读入 UI 的最大尾部字节数
-FOUNDATION_EXPORT NSUInteger const DCLMaxRuntimeLogTailBytes;
-
 NS_ASSUME_NONNULL_END

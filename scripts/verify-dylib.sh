@@ -52,7 +52,6 @@ required=(
     redirectStderrToRuntimeLog
     lastExitWasAbnormal
     dcl_appWillTerminate
-    buildCombinedText
     dcl_prepare_images
     dcl_signal_handler
     dcl_uncaught_exception_handler
@@ -67,10 +66,10 @@ done
 
 # 3) 禁止符号：已移除的功能必须清零
 echo "[3/5] 禁止符号（已移除功能不得残留）"
-for s in dcl_sendEvent; do
+for s in dcl_sendEvent DCLCrashLogViewer; do
     case "$all" in
-        *"$s"*) bad "仍存在 $s（摇一摇未被移除）" ;;
-        *)      pass "无 $s（摇一摇已移除）" ;;
+        *"$s"*) bad "仍存在 $s（极简版不应包含该符号）" ;;
+        *)      pass "无 $s（已移除）" ;;
     esac
 done
 
