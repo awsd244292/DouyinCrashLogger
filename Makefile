@@ -14,7 +14,7 @@ STRIP = echo
 # 源文件：不使用 Logos %hook（避免引入 substrate 依赖），全部用原生 runtime 交换 + C 信号捕获
 DouyinCrashLogger_FILES := DCLMain.m DCLConstants.m DCLCrashReporter.m DCLCrashLogViewer.m
 
-DouyinCrashLogger_CFLAGS := -fobjc-arc -Wno-deprecated-declarations
+DouyinCrashLogger_CFLAGS := -fobjc-arc -O0 -Wno-deprecated-declarations
 DouyinCrashLogger_LDFLAGS :=
 
 include $(THEOS)/makefiles/common.mk

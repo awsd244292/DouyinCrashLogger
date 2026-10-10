@@ -14,7 +14,7 @@
   - Objective-C 未捕获异常（`NSUncaughtException`）
   - 记录：设备型号、系统版本、抖音包名/版本、**崩溃类型与原因**、故障地址、崩溃线程回溯
 - 📂 **日志落盘**：写入抖音沙盒 `Documents/DouyinCrashLogs/`，按时间命名，自动保留最近 20 条
-- 📲 **摇一摇查看与导出**：在抖音内**摇一摇手机** → 弹出崩溃日志列表 → 点开看详情 → 可一键分享 / 保存 / 清除
+- 📲 **查看与导出**：进入抖音「设置」页 → 点右上角 **📋 崩溃日志** 按钮（或在抖音内**摇一摇**也可）→ 弹出日志列表 → 点开看详情 → 可一键分享 / 保存 / 清除
 - 🪶 **双保险**：自定义日志之外，仍会重新触发默认信号，由系统生成标准 crash report
 
 ---
@@ -24,7 +24,8 @@
 | 能力 | 实现 | 是否依赖 substrate |
 |---|---|---|
 | 崩溃捕获 | `signal()` / `sigaction()`（POSIX）+ `NSSetUncaughtExceptionHandler` | ❌ 否 |
-| 摇一摇入口 | `method_setImplementation()` 原生交换 `UIApplication -sendEvent:` | ❌ 否 |
+| 设置页入口 | 交换 `UIViewController -viewWillAppear:`（系统类，非抖音私有），用 `title` 命中“设置”页后追加 `UIBarButtonItem` | ❌ 否 |
+| 摇一摇入口（备选） | 原生交换 `UIApplication -sendEvent:` | ❌ 否 |
 | 日志写入 | 信号处理路径使用 `open/write/fsync/close`（async-signal-safe） | ❌ 否 |
 
 > 全程不使用 Logos `%hook`（那会引入 `_MSHookMessageEx` 等需要 substrate 的符号）。
@@ -40,7 +41,7 @@
 **方式 A — TrollStore（巨魔，推荐）**
 1. 安装 TrollStore + [TrollFools](https://github.com/Lessica/TrollFools)
 2. TrollFools → 选**抖音** → 注入 `DouyinCrashLogger.dylib` → 自动重装
-3. 打开抖音，复现崩溃后，**摇一摇**即可看到日志
+3. 打开抖音，进入「设置」页，点右上角 **📋 崩溃日志** 即可看到日志（也可摇一摇触发）
 
 **方式 B — 普通自签（AltStore / Sideloadly / Esign）**
 1. 准备抖音砸壳 IPA
@@ -79,7 +80,7 @@
 ## 日志导出
 
 - **直接取文件**：日志在抖音沙盒 `Documents/DouyinCrashLogs/`，可用 Filza 或自签工具导出 App 容器取出
-- **摇一摇面板**：列表 → 点开详情 → 右上角分享按钮 / 「全部导出」用系统分享（微信、备忘录、文件 App 等）
+- **设置页入口 / 摇一摇**：列表 → 点开详情 → 右上角分享按钮 / 「全部导出」用系统分享（微信、备忘录、文件 App 等）
 
 ---
 
