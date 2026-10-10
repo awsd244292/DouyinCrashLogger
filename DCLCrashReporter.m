@@ -437,4 +437,113 @@ static void dcl_prepare_meta(void) {
     }
 }
 
+#pragma mark - 最新状态快照（latest.log）
+
++ (NSString *)latestLogPath {
+    return [[self crashLogsDirectory] stringByAppendingPathComponent:DCLSnapshotLogFileName];
+}
+
++ (void)registerSnapshotTriggers {
+    @try {
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        // 截图：用户主动触发，且不与抖音任何手势冲突
+        [nc addObserver:self
+               selector:@selector(dcl_userDidTakeScreenshot:)
+                   name:UIApplicationUserDidTakeScreenshotNotification
+                 object:nil];
+        // 进入后台：切走 / 锁屏即自动落盘，便于随后导出容器取最新日志
+        [nc addObserver:self
+               selector:@selector(dcl_appDidEnterBackground:)
+                   name:UIApplicationDidEnterBackgroundNotification
+                 object:nil];
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
++ (void)dcl_userDidTakeScreenshot:(NSNotification *)note {
+    [self writeLatestLogWithReason:@"用户截图"];
+}
+
++ (void)dcl_appDidEnterBackground:(NSNotification *)note {
+    [self writeLatestLogWithReason:@"App 进入后台"];
+}
+
++ (void)writeLatestLogWithReason:(NSString *)reason {
+    @try {
+        NSString *dir = [self crashLogsDirectory];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+
+        NSMutableString *s = [NSMutableString string];
+        [s appendString:@"========== DouyinCrashLogger 最新状态快照 ==========\n"];
+        [s appendFormat:@"触发方式: %@\n", reason ?: @"(未知)"];
+        [s appendFormat:@"生成时间(unix): %lld.%06lld\n", (long long)tv.tv_sec, (long long)tv.tv_usec];
+        [s appendFormat:@"进程 pid: %d\n\n", (int)getpid()];
+
+        [s appendString:@"--- 上次退出状态 ---\n"];
+        if (g_first_launch) {
+            [s appendString:@"首次运行（无历史记录）\n"];
+        } else if (!g_prev_exit_normal) {
+            [s appendString:@"疑似闪退（无 ips 日志，可能 SIGKILL/OOM/早期崩溃）\n"];
+        } else {
+            [s appendString:@"正常\n"];
+        }
+        if (g_last_normal_exit_date) {
+            [s appendFormat:@"上次正常退出时间: %@\n", g_last_normal_exit_date];
+        }
+
+        [s appendString:@"\n--- 环境信息 ---\n"];
+        NSString *meta = [NSString stringWithUTF8String:g_meta];
+        if (meta.length) [s appendFormat:@"%@\n", meta];
+
+        void *frames[32];
+        int n = backtrace(frames, 32);
+        [s appendString:@"\n--- 触发时调用栈（原始地址，供 atos 符号化） ---\n"];
+        for (int i = 0; i < n; i++) {
+            [s appendFormat:@"#%-3d 0x%llx\n", i, (unsigned long long)(uintptr_t)frames[i]];
+        }
+
+        [s appendString:@"\n--- 已落盘崩溃日志 ---\n"];
+        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+        NSMutableArray *crashFiles = [NSMutableArray array];
+        for (NSString *f in files) {
+            if ([f hasPrefix:@"crash_"]) [crashFiles addObject:f];
+        }
+        [crashFiles sortUsingSelector:@selector(compare:)];
+        if (crashFiles.count == 0) {
+            [s appendString:@"(暂无崩溃日志)\n"];
+        } else {
+            for (NSString *f in crashFiles) {
+                NSString *p = [dir stringByAppendingPathComponent:f];
+                NSDictionary *a = [fm attributesOfItemAtPath:p error:nil];
+                [s appendFormat:@"%@  (%llu bytes, %@)\n", f,
+                 [a[NSFileSize] unsignedLongLongValue], a[NSFileModificationDate] ?: @"(未知时间)"];
+            }
+        }
+
+        [s appendString:@"\n--- 运行时日志 ---\n"];
+        NSDictionary *ra = [fm attributesOfItemAtPath:[self runtimeLogPath] error:nil];
+        if (ra) {
+            [s appendFormat:@"plugin_runtime.log  存在  (%llu bytes)\n",
+             [ra[NSFileSize] unsignedLongLongValue]];
+        } else {
+            [s appendString:@"plugin_runtime.log  不存在（可能尚未到重定向时机）\n"];
+        }
+
+        [s appendString:@"\n--- 已加载镜像基址表 ---\n"];
+        NSString *imgs = [NSString stringWithUTF8String:g_image_table];
+        if (imgs.length) [s appendFormat:@"%@\n", imgs];
+
+        [s appendString:@"===================================================\n"];
+
+        [s writeToFile:[self latestLogPath] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
 @end

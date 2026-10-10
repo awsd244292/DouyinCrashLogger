@@ -30,15 +30,20 @@ __attribute__((constructor)) static void dcl_entry(void) {
         //    这样即使没有 App 内页面，直接读容器里的文件也能判断；
         //    同时注册 WillTerminate 观察者，供下一轮判定。
         [DCLCrashReporter recordExitMarkAndRegisterTerminateObserver];
+
+        // 3) 注册「生成最新日志 latest.log」的触发器（截图 / 进入后台）
+        [DCLCrashReporter registerSnapshotTriggers];
     } @catch (id e) {
         (void)e;
     }
 
-    // 3) stderr/stdout 重定向延迟 2s，等主 runloop 稳定后再执行
+    // 4) stderr/stdout 重定向延迟 2s，等主 runloop 稳定后再执行；
+    //    随后自动写一份最新快照，保证即使从不主动触发也有 latest.log。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @try {
             [DCLCrashReporter redirectStderrToRuntimeLog];
+            [DCLCrashReporter writeLatestLogWithReason:@"启动完成（自动）"];
         } @catch (id e) {
             (void)e;
         }

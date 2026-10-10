@@ -55,6 +55,8 @@ required=(
     dcl_prepare_images
     dcl_signal_handler
     dcl_uncaught_exception_handler
+    registerSnapshotTriggers
+    writeLatestLogWithReason
 )
 for s in "${required[@]}"; do
     # 用 case 做子串匹配，不走管道，规避 SIGPIPE 误判

@@ -50,6 +50,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// 运行时 stderr 日志的完整路径
 + (NSString *)runtimeLogPath;
 
+/// 最新状态快照日志（latest.log）的完整路径
++ (NSString *)latestLogPath;
+
+/// 注册「生成最新日志」的触发器（全部走系统公开通知，不 hook 任何方法）：
+///   - 用户截图        UIApplicationUserDidTakeScreenshotNotification
+///   - App 进入后台    UIApplicationDidEnterBackgroundNotification
++ (void)registerSnapshotTriggers;
+
+/// 立即生成/覆盖一份最新状态快照日志（latest.log）
++ (void)writeLatestLogWithReason:(NSString *)reason;
+
 @end
 
 NS_ASSUME_NONNULL_END

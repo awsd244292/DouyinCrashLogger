@@ -24,4 +24,7 @@ FOUNDATION_EXPORT NSString * const DCLLastNormalExitTimeKey;
 /// 运行时 stderr 重定向日志文件名（存放在崩溃日志目录下）
 FOUNDATION_EXPORT NSString * const DCLRuntimeLogFileName;
 
+/// 最新状态快照日志文件名（每次触发即覆盖，永远是最新的那份）
+FOUNDATION_EXPORT NSString * const DCLSnapshotLogFileName;
+
 NS_ASSUME_NONNULL_END
