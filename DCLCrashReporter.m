@@ -196,7 +196,8 @@ static void dcl_uncaught_exception_handler(NSException *exception) {
         [report appendFormat:@"CrashType: NSException:%@\n", exception.name ?: @"(null)"];
         [report appendFormat:@"Detail: reason: %@\n", exception.reason ?: @"(null)"];
         [report appendString:@"\n--- callStackSymbols ---\n"];
-        [report appendString:[[exception.callStackSymbols componentsJoinedByString:@"\n"] ?: @"(none)"];
+        NSString *stack = [exception.callStackSymbols componentsJoinedByString:@"\n"];
+        [report appendString:(stack ?: @"(none)")];
         [report appendString:@"\n===================================================\n"];
 
         NSString *fileName = [NSString stringWithFormat:@"crash_%lld_%06lld_P%d.log",
