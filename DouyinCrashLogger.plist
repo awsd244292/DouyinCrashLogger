@@ -9,6 +9,7 @@
         <key>Bundles</key>
         <array>
             <string>com.ss.iphone.ugc.Aweme</string>
+            <string>com.ss.iphone.ugc.Aweme1</string>
             <string>com.ss.iphone.ugc.Sharee</string>
         </array>
     </dict>

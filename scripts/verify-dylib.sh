@@ -51,13 +51,65 @@ required=(
     recordExitMarkAndRegisterTerminateObserver
     redirectStderrToRuntimeLog
     lastExitWasAbnormal
+    previousExitKind
+    previousExitDescription
     dcl_appWillTerminate
+    dcl_appDidEnterBackgroundState
+    dcl_appDidBecomeActiveState
+    dcl_appendPreviousExitVerdictToRuntimeLog
     dcl_prepare_images
     dcl_signal_handler
     dcl_uncaught_exception_handler
     registerSnapshotTriggers
     writeLatestLogWithReason
+    # —— 1.3 新增：三大旁路观测模块必须已编入 ——
+    dcl_appendPlaybackDiagnosis
+    dcl_appendHealthCheck
+    dcl_appendAllThreadsSnapshot
+    DCLWatchdog
+    dcl_loop_activity
+    dcl_sample_main_thread
+    captureAllThreadsSnapshot
+    DCLPlaybackTracer
+    dcl_capture
+    dcl_sendEvent
+    DCLHealthCheck
+    checkMainThreadResponsive
+    # —— 1.3 新增：两档采集方案开关（A 零 hook / B hook 全开）——
+    DCLConfig
+    captureProfile
+    hooksEnabled
+    deepEvidenceEnabled
+    dcl_appendCaptureProfile
+    checkCaptureProfile
+    enabledCapabilities
+    disabledCapabilities
 )
+
+# 2b) 退出判定修正必须以 NSUserDefaults key 的形式落到二进制里，
+#     这三个 key 缺任何一个，都说明「用户主动划掉 vs 真闪退」的区分没进包。
+echo "[2b] 退出性质判定所需的持久化 key"
+for s in DCL_last_launch_time DCL_last_exit_was_backgrounded DCL_last_enter_background_time; do
+    case "$all" in
+        *"$s"*) pass "$s" ;;
+        *)      bad "缺失 key $s（退出性质判定无法成立）" ;;
+    esac
+done
+# 旧版单一判定文案不应再出现
+case "$all" in
+    *"可能 SIGKILL/OOM/早期崩溃"*) bad "残留旧版二值判定文案" ;;
+    *)                             pass "旧版二值判定文案已替换" ;;
+esac
+
+# 2c) 两档采集方案的开关必须落到二进制：缺了开关，A/B 方案就无法区分，
+#     「hook 全开」与「零 hook」会退化成同一个版本，方案分档失去意义。
+echo "[2c] 采集方案开关（A safe / B full）"
+for s in capture_mode.txt DCL_capture_mode; do
+    case "$all" in
+        *"$s"*) pass "$s" ;;
+        *)      bad "缺失 $s（两档采集方案无法切换）" ;;
+    esac
+done
 for s in "${required[@]}"; do
     # 用 case 做子串匹配，不走管道，规避 SIGPIPE 误判
     case "$all" in
@@ -68,7 +120,9 @@ done
 
 # 3) 禁止符号：已移除的功能必须清零
 echo "[3/5] 禁止符号（已移除功能不得残留）"
-for s in dcl_sendEvent DCLCrashLogViewer; do
+# 注意：dcl_sendEvent 自 1.3 起已合法复用于 DCLPlaybackTracer（纯旁路触摸时间戳钩子），
+#       不再列入禁止清单；仅 DCLCrashLogViewer（极简版移除的 UI 层）仍需清零。
+for s in DCLCrashLogViewer; do
     case "$all" in
         *"$s"*) bad "仍存在 $s（极简版不应包含该符号）" ;;
         *)      pass "无 $s（已移除）" ;;
