@@ -10,9 +10,16 @@
 
 #import <dlfcn.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
+#import <mach/thread_act.h>
+// ARM_THREAD_STATE64 的具体定义在各架构子头里，用 __has_include 守卫避免
+// SDK 变动时把「文件不存在」变成 fatal error。
+#if __has_include(<mach/machine/thread_status.h>)
+#import <mach/machine/thread_status.h>
+#endif
+// 不要 import <mach/mach_vm.h>：iOS SDK 里该文件整个是 #error，仅 macOS 可用
 #import <pthread.h>
-#import <pthread_machdep.h>
+// 不要 import <pthread_machdep.h>：同样是 macOS 私有头。
+// pthread_from_mach_thread_np / pthread_mach_thread_np 在 <pthread.h> 里就有声明。
 #import <stdatomic.h>
 #import <string.h>
 #import <sys/time.h>
@@ -100,10 +107,13 @@ static void dcl_loop_activity(CFRunLoopObserverRef observer, CFRunLoopActivity a
 
 #pragma mark - Mach 主线程栈回溯
 
-static BOOL dcl_read_mem(mach_vm_address_t src, void *dst, mach_vm_size_t size) {
-    mach_vm_size_t outSize = 0;
-    kern_return_t kr = mach_vm_read_overwrite(mach_task_self(), src, size,
-                                              (mach_vm_address_t)dst, &outSize);
+// iOS SDK 没有 <mach/mach_vm.h>（里面直接 #error），mach_vm_* 系列是 macOS 专用。
+// 对应到 iOS 的公开接口是 vm_read_overwrite（声明在 <mach/vm_map.h>，<mach/mach.h> 已包含）。
+// arm64 上 vm_address_t 与 mach_vm_address_t 同为 64 位，语义等价。
+static BOOL dcl_read_mem(vm_address_t src, void *dst, vm_size_t size) {
+    vm_size_t outSize = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), src, size,
+                                         (vm_address_t)dst, &outSize);
     return (kr == KERN_SUCCESS && outSize == size);
 }
 
@@ -212,7 +222,7 @@ static void dcl_append_frame(NSMutableString *out, int idx, uint64_t addr) {
 /// 只收集一个线程的原始返回地址，不做任何格式化 / 分配 / 符号化。
 ///
 /// 这是整个快照里唯一允许在「其他线程被 suspend」状态下执行的操作：
-/// 函数体内只有 thread_get_state 与 mach_vm_read_overwrite，两者都是直接陷入内核的
+/// 函数体内只有 thread_get_state 与 vm_read_overwrite，两者都是直接陷入内核的
 /// 系统调用，不经过 malloc、不经过 dyld。
 ///
 /// 为什么必须这么苛刻：被 suspend 的线程随时可能正持有 malloc 的全局锁或 dyld 锁。

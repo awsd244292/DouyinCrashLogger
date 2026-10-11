@@ -11,6 +11,7 @@
 #import <dlfcn.h>
 #import <objc/runtime.h>
 #import <execinfo.h>
+#import <mach-o/dyld.h>   // _dyld_image_count / _dyld_get_image_name
 #import <string.h>
 #import <sys/time.h>
 

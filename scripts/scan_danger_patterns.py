@@ -26,6 +26,18 @@ FOUNDATION = re.compile(
 )
 # 内存分配
 ALLOC = re.compile(r"\b(malloc|calloc|realloc|free|NSAllocateObject)\b")
+
+
+def strip_comments(text: str) -> str:
+    """去掉 // 行注释与 /* */ 块注释后再做匹配。
+
+    踩过的坑：注释里常常写着「不要调用 dladdr」「要用 NSGetUncaughtExceptionHandler」
+    这类说明，纯文本匹配会把它当成真实调用，导致规则该报不报。
+    （代价：@"http://..." 这类字符串里的内容也会被削掉，本工程无此情况。）
+    """
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    return text
 # 符号化 / 镜像遍历：拿 dyld 全局锁
 DYLD = re.compile(r"\b(dladdr|dlopen|dlsym|_dyld_image_count|_dyld_get_image_header|_dyld_get_image_name|backtrace_symbols)\b")
 # 明确非 async-signal-safe
@@ -188,16 +200,23 @@ def scan_file(path: Path):
                         "宿主自身的崩溃监控与收尾逻辑被静默切断")
                     break
 
-    # ---------- 规则 13：丢弃 NSSetUncaughtExceptionHandler 的返回值 ----------
-    # 返回值就是宿主原有的未捕获异常处理器。丢弃 = 静默切断宿主异常上报链
-    # （与 R7 同类，但发生在 OC 异常路径，光看 sigaction 扫不到）。
-    for i, ln in enumerate(lines, 1):
-        if "NSSetUncaughtExceptionHandler" not in ln or ln.lstrip().startswith("//"):
-            continue
-        if not re.search(r"^\s*(?:static\s+)?[\w\s\*]*\w+\s*=\s*NSSetUncaughtExceptionHandler", ln):
-            add("P1", "R13 丢弃原有未捕获异常处理器", path, i, ln,
-                "NSSetUncaughtExceptionHandler 返回宿主/其他插件原有的 handler；"
-                "丢弃即静默切断宿主的异常统计与收尾逻辑，且不转发也无法恢复")
+    # ---------- 规则 13：覆盖宿主未捕获异常处理器却不保存原 handler ----------
+    # 注意 API 语义：NSSetUncaughtExceptionHandler 返回 **void**，拿不到原 handler。
+    # 原 handler 必须用 NSGetUncaughtExceptionHandler() 在设置「之前」取回。
+    # 不保存 = 静默切断宿主的异常统计与收尾逻辑（与 R7 同类，
+    # 但发生在 OC 异常路径，光扫 sigaction 扫不到）。
+    code = strip_comments(src)   # 注释里提到 NSGet 不算真调用了它
+    if "NSSetUncaughtExceptionHandler" in code:
+        has_get = re.search(r"NSGetUncaughtExceptionHandler\s*\(", code)
+        if not has_get:
+            for i, ln in enumerate(lines, 1):
+                if "NSSetUncaughtExceptionHandler" not in ln or ln.lstrip().startswith("//"):
+                    continue
+                add("P1", "R13 覆盖宿主异常处理器且未保存原 handler", path, i, ln,
+                    "NSSetUncaughtExceptionHandler 返回 void，拿不到原 handler；"
+                    "必须先用 NSGetUncaughtExceptionHandler() 取回并保存，"
+                    "否则宿主的异常统计与收尾逻辑被静默切断且无法恢复")
+                break
 
     # ---------- 规则 8：递归保护分支直接 return（可能无限循环） ----------
     for i, ln in enumerate(lines, 1):

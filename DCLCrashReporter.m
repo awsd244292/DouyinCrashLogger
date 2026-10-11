@@ -541,8 +541,12 @@ static void dcl_prepare_meta(void) {
     @try { dcl_prepare_images(); }                                  @catch (id e) { (void)e; }
     @try { dcl_install_signals(); }                                 @catch (id e) { (void)e; }
     @try {
-        // 返回值即宿主原有 handler，保存下来用于链式转发（不能丢）
-        g_prev_uncaught = NSSetUncaughtExceptionHandler(&dcl_uncaught_exception_handler);
+        // 注意顺序与 API 语义：NSSetUncaughtExceptionHandler 返回 void，
+        // 它「不」返回原 handler —— 原 handler 要用 NSGetUncaughtExceptionHandler() 先取。
+        // （曾在这里直接把 setter 的返回值当原 handler 存下来，那是错的，
+        //   链式转发会跳到一个非法地址上。）
+        g_prev_uncaught = NSGetUncaughtExceptionHandler();
+        NSSetUncaughtExceptionHandler(&dcl_uncaught_exception_handler);
     } @catch (id e) { (void)e; }
 }
 
