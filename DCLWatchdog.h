@@ -78,6 +78,11 @@ typedef NS_ENUM(NSUInteger, DCLStallCause) {
 /// 绝不长期持有任何线程的挂起态（@try/@finally 保证 resume）。
 + (NSString *)captureAllThreadsSnapshot;
 
+/// 抓取全线程快照并缓存到 lastAllThreadsSnapshot（卡死 / 后台取证用）。
+/// 必须与 captureAllThreadsSnapshot 一起在头文件声明 —— 它在本文件内被调用的位置
+/// 早于实现，缺声明会直接编译失败。
++ (void)captureAndStoreAllThreadsSnapshot;
+
 /// 最近一次卡死时自动抓取并缓存的全线程快照（卡死取证用）。无则返回 nil。
 + (nullable NSString *)lastAllThreadsSnapshot;
 

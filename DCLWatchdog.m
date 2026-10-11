@@ -11,11 +11,30 @@
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach/thread_act.h>
+#import <mach-o/dyld.h>    // _dyld_image_count / _dyld_get_image_name
 // ARM_THREAD_STATE64 的具体定义在各架构子头里，用 __has_include 守卫避免
 // SDK 变动时把「文件不存在」变成 fatal error。
 #if __has_include(<mach/machine/thread_status.h>)
 #import <mach/machine/thread_status.h>
 #endif
+// arm64e 下 arm_thread_state64 的 pc/lr/fp 字段是 __opaque_*（带 PAC 签名），
+// 直接读会拿到带签名的指针。SDK 提供的 arm_thread_state64_get_*() 访问器会做
+// 正确的 ptrauth 剥离，必须走访问器。老 SDK 没有访问器时退回字段直读。
+#if __has_include(<mach/arm/thread_status.h>)
+#import <mach/arm/thread_status.h>
+#define DCL_HAS_TS_ACCESSORS 1
+#endif
+
+#if defined(DCL_HAS_TS_ACCESSORS)
+#define DCL_TS_PC(s) arm_thread_state64_get_pc(s)
+#define DCL_TS_LR(s) arm_thread_state64_get_lr(s)
+#define DCL_TS_FP(s) arm_thread_state64_get_fp(s)
+#else
+#define DCL_TS_PC(s) ((s).__pc)
+#define DCL_TS_LR(s) ((s).__lr)
+#define DCL_TS_FP(s) ((s).__fp)
+#endif
+
 // 不要 import <mach/mach_vm.h>：iOS SDK 里该文件整个是 #error，仅 macOS 可用
 #import <pthread.h>
 // 不要 import <pthread_machdep.h>：同样是 macOS 私有头。
@@ -135,9 +154,9 @@ static void dcl_sample_main_thread(uint64_t *outAddrs, int *outCount) {
             return;
         }
 
-        uint64_t pc = dcl_strip(mc.__ss.__pc);
-        uint64_t lr = dcl_strip(mc.__ss.__lr);
-        uint64_t fp = dcl_strip(mc.__ss.__fp);
+        uint64_t pc = dcl_strip(DCL_TS_PC(mc.__ss));
+        uint64_t lr = dcl_strip(DCL_TS_LR(mc.__ss));
+        uint64_t fp = dcl_strip(DCL_TS_FP(mc.__ss));
 
         addrs[n++] = pc;
         if (lr && lr != pc) addrs[n++] = lr;
@@ -237,9 +256,9 @@ static int dcl_collect_thread_addrs(thread_t t, uint64_t *out, int maxFrames) {
         return 0;
     }
 
-    uint64_t pc = dcl_strip(mc.__ss.__pc);
-    uint64_t lr = dcl_strip(mc.__ss.__lr);
-    uint64_t fp = dcl_strip(mc.__ss.__fp);
+    uint64_t pc = dcl_strip(DCL_TS_PC(mc.__ss));
+    uint64_t lr = dcl_strip(DCL_TS_LR(mc.__ss));
+    uint64_t fp = dcl_strip(DCL_TS_FP(mc.__ss));
 
     int n = 0;
     out[n++] = pc;

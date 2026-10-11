@@ -11,6 +11,7 @@
 
 #import <dlfcn.h>
 #import <mach/mach.h>
+#import <mach-o/dyld.h>   // _dyld_image_count / _dyld_get_image_name
 #import <signal.h>
 #import <sys/time.h>
 #import <unistd.h>
