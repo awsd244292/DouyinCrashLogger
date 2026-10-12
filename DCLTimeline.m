@@ -29,7 +29,7 @@
 // 这里就不再重复定义一份（重复宏一旦改歪一处，两边结构体布局立刻错位）。
 typedef DCLTimelineEntry DCLTlEntry;
 
-static DCLTlEntry   g_buf[DCL_TL_CAP];
+static DCLTlEntry   g_buf[DCL_TL_CAPACITY];
 static uint32_t     g_head  = 0;   ///< 下一个写入的槽位
 static uint64_t     g_total = 0;   ///< 累计写入条数（含已被覆盖的）
 static uint32_t     g_seq   = 0;
@@ -68,12 +68,12 @@ void DCLTimelineRecordC(DCLTimelineEventKind kind, int32_t aux, const char *deta
     e->aux     = aux;
     e->seq     = g_seq++;
     if (detail && detail[0]) {
-        strncpy(e->detail, detail, DCL_TL_DETAIL - 1);
-        e->detail[DCL_TL_DETAIL - 1] = '\0';
+        strncpy(e->detail, detail, DCL_TL_DETAIL_LEN - 1);
+        e->detail[DCL_TL_DETAIL_LEN - 1] = '\0';
     } else {
         e->detail[0] = '\0';
     }
-    g_head = (g_head + 1) % DCL_TL_CAP;
+    g_head = (g_head + 1) % DCL_TL_CAPACITY;
     g_total++;
     os_unfair_lock_unlock(&g_lock);
 }
@@ -82,8 +82,8 @@ void DCLTimelineRecordC(DCLTimelineEventKind kind, int32_t aux, const char *deta
 
 /// 计算缓冲读取的起点与有效条数。崩溃路径与普通路径共用一段换算，避免两处写歪。
 static inline void dcl_tl_range(uint32_t *outStart, NSUInteger *outCount) {
-    NSUInteger n = g_total > (uint64_t)DCL_TL_CAP ? (NSUInteger)DCL_TL_CAP : (NSUInteger)g_total;
-    NSUInteger start = (NSUInteger)((g_head + DCL_TL_CAP - (uint32_t)n) % DCL_TL_CAP);
+    NSUInteger n = g_total > (uint64_t)DCL_TL_CAPACITY ? (NSUInteger)DCL_TL_CAPACITY : (NSUInteger)g_total;
+    NSUInteger start = (NSUInteger)((g_head + DCL_TL_CAPACITY - (uint32_t)n) % DCL_TL_CAPACITY);
     *outStart = (uint32_t)start;
     *outCount = n;
 }
@@ -96,7 +96,7 @@ static NSUInteger dcl_tl_snapshot(DCLTlEntry *out, NSUInteger cap) {
     dcl_tl_range(&start, &n);
     NSUInteger m = n < cap ? n : cap;
     for (NSUInteger i = 0; i < m; i++) {
-        out[i] = g_buf[(start + i) % DCL_TL_CAP];
+        out[i] = g_buf[(start + i) % DCL_TL_CAPACITY];
     }
     os_unfair_lock_unlock(&g_lock);
     return m;
@@ -109,7 +109,7 @@ size_t DCLTimelineCopyEntriesUnsafe(DCLTimelineEntry *out, size_t cap) {
     dcl_tl_range(&start, &n);
     size_t m = n < cap ? (size_t)n : cap;
     for (size_t i = 0; i < m; i++) {
-        out[i] = g_buf[(start + i) % DCL_TL_CAP];
+        out[i] = g_buf[(start + i) % DCL_TL_CAPACITY];
     }
     return m;
 }
@@ -179,7 +179,7 @@ static NSString *dcl_tl_format(const DCLTlEntry *e, uint64_t baseMono, NSUIntege
 + (uint64_t)totalRecorded { return g_total; }
 
 + (NSUInteger)bufferedCount {
-    return g_total > (uint64_t)DCL_TL_CAP ? (NSUInteger)DCL_TL_CAP : (NSUInteger)g_total;
+    return g_total > (uint64_t)DCL_TL_CAPACITY ? (NSUInteger)DCL_TL_CAPACITY : (NSUInteger)g_total;
 }
 
 + (NSUInteger)copyEntries:(DCLTimelineEntry *)out capacity:(NSUInteger)cap {
@@ -187,18 +187,18 @@ static NSString *dcl_tl_format(const DCLTlEntry *e, uint64_t baseMono, NSUIntege
 }
 
 + (NSArray<NSString *> *)formattedLines {
-    return [self formattedLinesLimit:DCL_TL_CAP];
+    return [self formattedLinesLimit:DCL_TL_CAPACITY];
 }
 
 + (NSArray<NSString *> *)formattedLinesLimit:(NSUInteger)limit {
-    NSUInteger cap = limit > DCL_TL_CAP ? DCL_TL_CAP : limit;
+    NSUInteger cap = limit > DCL_TL_CAPACITY ? DCL_TL_CAPACITY : limit;
     if (cap == 0) return @[];
 
     // 整缓冲拷出来再取尾部 cap 条：想要的是「最近 N 条」，
     // 若直接拷 cap 条拿到的是最旧的一批，相对时间基准也就跟着偏了。
-    DCLTlEntry *all = (DCLTlEntry *)calloc(DCL_TL_CAP, sizeof(DCLTlEntry));
+    DCLTlEntry *all = (DCLTlEntry *)calloc(DCL_TL_CAPACITY, sizeof(DCLTlEntry));
     if (!all) return @[];
-    NSUInteger total = dcl_tl_snapshot(all, DCL_TL_CAP);
+    NSUInteger total = dcl_tl_snapshot(all, DCL_TL_CAPACITY);
     if (total == 0) { free(all); return @[]; }
 
     NSUInteger skip = total > cap ? total - cap : 0;
@@ -220,9 +220,9 @@ static NSString *dcl_tl_format(const DCLTlEntry *e, uint64_t baseMono, NSUIntege
 + (BOOL)avPlayerSeen { return [self avPlayerSeenCount] > 0; }
 
 + (NSUInteger)avPlayerSeenCount {
-    DCLTlEntry *all = (DCLTlEntry *)calloc(DCL_TL_CAP, sizeof(DCLTlEntry));
+    DCLTlEntry *all = (DCLTlEntry *)calloc(DCL_TL_CAPACITY, sizeof(DCLTlEntry));
     if (!all) return 0;
-    NSUInteger n = dcl_tl_snapshot(all, DCL_TL_CAP);
+    NSUInteger n = dcl_tl_snapshot(all, DCL_TL_CAPACITY);
     NSUInteger c = 0;
     for (NSUInteger i = 0; i < n; i++) {
         if (all[i].kind == (uint32_t)DCLTlKindAVPlayerSeen) c++;
@@ -232,9 +232,9 @@ static NSString *dcl_tl_format(const DCLTlEntry *e, uint64_t baseMono, NSUIntege
 }
 
 + (double)millisecondsSinceLastKind:(DCLTimelineEventKind)kind {
-    DCLTlEntry *all = (DCLTlEntry *)calloc(DCL_TL_CAP, sizeof(DCLTlEntry));
+    DCLTlEntry *all = (DCLTlEntry *)calloc(DCL_TL_CAPACITY, sizeof(DCLTlEntry));
     if (!all) return -1.0;
-    NSUInteger n = dcl_tl_snapshot(all, DCL_TL_CAP);
+    NSUInteger n = dcl_tl_snapshot(all, DCL_TL_CAPACITY);
     uint64_t now = DCLTimelineMonoNow();
     double best = -1.0;
     for (NSUInteger i = 0; i < n; i++) {
@@ -250,9 +250,9 @@ static NSString *dcl_tl_format(const DCLTlEntry *e, uint64_t baseMono, NSUIntege
 + (NSArray<NSString *> *)contextLinesBefore:(DCLTimelineEventKind)anchor
                                    windowMs:(double)windowMs
                                       limit:(NSUInteger)limit {
-    DCLTlEntry *all = (DCLTlEntry *)calloc(DCL_TL_CAP, sizeof(DCLTlEntry));
+    DCLTlEntry *all = (DCLTlEntry *)calloc(DCL_TL_CAPACITY, sizeof(DCLTlEntry));
     if (!all) return @[];
-    NSUInteger n = dcl_tl_snapshot(all, DCL_TL_CAP);
+    NSUInteger n = dcl_tl_snapshot(all, DCL_TL_CAPACITY);
     if (n == 0) { free(all); return @[]; }
 
     // 找最近一次锚点事件
