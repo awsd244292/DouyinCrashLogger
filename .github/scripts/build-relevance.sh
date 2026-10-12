@@ -8,7 +8,14 @@ is_direct_build_path() {
     local path=$1
 
     case "$path" in
-        DYYY.plist|control|Resources/*|layout/*)
+        DYYY.plist|DouyinCrashLogger.plist|control|Resources/*|layout/*)
+            return 0
+            ;;
+        # 构建脚本本身就是产出 dylib 的那道工序 —— 改了编译参数、链接参数、
+        # 产物命名却判定为「与构建无关」，CI 会一路绿灯地什么都不做，
+        # 比直接失败更难发现。曾经就因为漏了这两条，改 tools/build_dylib.sh
+        # 之后拿到的是上一版的产物。
+        tools/*|scripts/*)
             return 0
             ;;
     esac
