@@ -50,7 +50,10 @@ static BOOL dcl_hs_class_owns_method(Class cls, SEL sel) {
 }
 
 /// 取原方法 encoding 后替换，避免手写 type encoding 出错。
-static BOOL dcl_hs_try_hook(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
+/// 出参用 void ** 而非 IMP *：clang 下 IMP 是 void(*)(void)，与本项目的
+/// void(*)(id,SEL,id,id) 函数指针不兼容且 -Werror 会报错，故沿用
+/// DCLPlaybackTracer 的 (void **) 强转写法绕过类型检查。
+static BOOL dcl_hs_try_hook(Class cls, SEL sel, IMP newImp, void **outOrig) {
     if (!cls) return NO;
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return NO;
@@ -60,7 +63,7 @@ static BOOL dcl_hs_try_hook(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
     IMP orig = class_replaceMethod(cls, sel, newImp, enc);
     if (!orig) return NO;            // 本类无实现，无处透传，宁可不挂
     if (orig == newImp) return NO;   // 再挂会形成自环
-    *outOrig = orig;
+    *outOrig = (void *)orig;
     return YES;
 }
 
@@ -138,7 +141,7 @@ static void dcl_hs_touchesEnded(id self, SEL _cmd, NSSet *touches, UIEvent *even
         Class viewCls = NSClassFromString(@"UIView");
         if (viewCls) {
             dcl_hs_try_hook(viewCls, @selector(touchesEnded:withEvent:),
-                            (IMP)dcl_hs_touchesEnded, &dcl_hs_orig_touchesEnded);
+                            (IMP)dcl_hs_touchesEnded, (void **)&dcl_hs_orig_touchesEnded);
         }
     } @catch (id e) {
         (void)e;
