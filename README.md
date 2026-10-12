@@ -133,24 +133,32 @@
 
 ## 构建
 
-纯 clang 交叉编译（**无需 Theos、无需 macOS**），CI 在 ubuntu runner 上装好 `clang + lld + llvm`
-后直接编译，整体比 Theos 流程更快更轻。
+**不用 macOS**：clang（上游 LLVM）+ `ld64.lld`（LLVM 的 Mach-O 链接器）+ iPhoneOS SDK，
+三件齐活，Linux 就是你的 Xcode。详见 `tools/` 与文档《28-非macOS编译iOS-dylib方案》。
 
-**首次**（一次性拉取 iPhoneOS SDK，约 220MB，放 `~/.pdp-sdks`）：
+**首次**（自动稀疏拉取 iPhoneOS SDK，约 220MB，落到 `~/.pdp-sdks`，之后离线复用）：
 ```bash
-make fetch-sdk
+make dylib        # 探工具链 → 拉 SDK → 编译 → 链接 → 纯 Python 结构自检（一步到位）
 ```
 
 **日常**：
 ```bash
-make dylib        # 产出 build/DouyinCrashLogger.dylib（fat arm64 + arm64e）
+make dylib        # 交叉编译 -> build/DouyinCrashLogger.dylib（arm64）
+make syntax       # 快速语法冒烟（-fsyntax-only，需 SDK）
+make verify       # 对已有 dylib 跑纯 Python Mach-O 结构自检
 make deb          # 打包 build/DouyinCrashLogger_<版本>.deb（越狱用；巨魔/自签注入只用 dylib）
-make precheck     # 静态自检（符号/解析回归），无需 SDK
-make verify       # 对已有 dylib 跑交付前静态自检
+make precheck     # 项目自有门禁（无需 SDK）
 ```
 
+**可调环境变量**：`MIN_IOS`、`SDK_VERSION`、`SDK_SYSROOT`、`OUT`、`CC`、`LD`。
+
+> **架构说明**：只用 arm64。LLVM 的 `ld64.lld` 不支持 Apple 私有 ptrauth ABI，
+> `-arch arm64e` 编出来的 `cpusubtype` 是 `0x0`、与 arm64 逐字节相同，属假货——
+> 本工程宁可明确拒绝，也不交付"名字叫 arm64e 实际是 arm64"的产物。
+> 注入到 arm64e 宿主 App 无影响（dyld 支持混合加载）；真要 arm64e 请走 macOS + Theos。
+
 仓库自带 `.github/workflows/build.yml`：push 到 `main` 或手动触发即自动产出
-**单一 `DouyinCrashLogger.dylib` + `.deb`** 并上传为 Action Artifact，零越狱路径残留。
+**`DouyinCrashLogger.dylib` + `.deb`** 并上传为 Action Artifact，零越狱路径残留。
 
 ---
 
