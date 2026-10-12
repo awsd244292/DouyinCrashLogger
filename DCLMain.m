@@ -41,6 +41,7 @@
 #import "DCLLogger.h"
 #import "DCLSystemSignal.h"
 #import "DCLTimelinePersist.h"
+#import "DCLResourceProbe.h"
 
 __attribute__((constructor)) static void dcl_entry(void) {
     @try {
@@ -88,6 +89,11 @@ __attribute__((constructor)) static void dcl_entry(void) {
             // 它被杀的那一刻（OOM / watchdog / 用户上滑）最后几秒的上下文
             // 只有磁盘上的那一份能活下来，这是整条时间线唯一扛得住进程死亡的形式。
             [DCLTimelinePersist startWithDirectory:[DCLCrashReporter crashLogsDirectory]];
+
+            // 健康水位采样：每 15s 记一笔进程内存与主线程状态。
+            // 它唯一的价值在「本进程死后」—— 被 OOM / watchdog 杀掉时不留任何信号，
+            // 下轮启动要靠这些遗留数据才能把「疑似闪退」坐实成具体原因。
+            [DCLResourceProbe start];
 
             // 播放探针会交换 AVPlayer / UIApplication 的方法实现 —— 只有 B 方案（full）才装。
             // A 方案（safe）下这一分支不执行，本进程内不会有任何方法交换。

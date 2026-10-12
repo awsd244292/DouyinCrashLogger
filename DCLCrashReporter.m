@@ -15,6 +15,7 @@
 #import "DCLTimeline.h"
 #import "DCLSystemSignal.h"
 #import "DCLTimelinePersist.h"
+#import "DCLResourceProbe.h"
 #import "DCLHealthCheck.h"
 
 #import <UIKit/UIKit.h>
@@ -858,9 +859,57 @@ static void dcl_prepare_meta(void) {
         case DCLPreviousExitKindForegroundCrashed:
             return @"前台崩溃（已生成崩溃日志）";
         case DCLPreviousExitKindSuspicious:
-            return @"疑似闪退（前台异常终止且无崩溃记录，可能 OOM/watchdog/早期崩溃）";
+            return [self dcl_suspiciousExitDescription];
     }
     return @"(未知)";
+}
+
+/// 把「疑似闪退」这一档再往下钻一层。
+///
+/// 为什么值得钻：OOM / watchdog / 早期崩溃三者虽然都表现为「前台异常终止且无报告」，
+/// 但处置方向完全不同 —— OOM 要查内存大户，watchdog 要查主线程，
+/// 早期崩溃要查启动路径。以前把它们装进同一句话里，等于把用户推回原点。
+///
+/// 依据是上一次还活着的进程最后留下的水位（见 DCLResourceProbe）：
+/// SIGKILL 抓不住，能指望的只有进程死前自己记的那一笔。
++ (NSString *)dcl_suspiciousExitDescription {
+    NSDictionary *w = [DCLResourceProbe previousSessionWatermark];
+    if (!w) {
+        return @"疑似闪退（前台异常终止且无崩溃记录，无可用水位数据）";
+    }
+
+    double fpMB   = [w[@"lastFootprint"] doubleValue] / (1024.0 * 1024.0);
+    double peakMB = [w[@"peakFootprint"] doubleValue] / (1024.0 * 1024.0);
+    double avMB   = [w[@"lastAvailable"] doubleValue] / (1024.0 * 1024.0);
+    double stall  = [w[@"lastStallMs"] doubleValue];
+
+    // OOM 判据：死前进程占用很高，或系统可用内存已被压到很低。
+    // 阈值取经验值：占用超 600MB 或可用低于 50MB，二者居其一即高度可疑 ——
+    // 这不是精确科学（真值随机型而异），给的是「优先从内存查起」的方向。
+    BOOL oomSuspect = (fpMB >= 600.0) || (avMB > 0 && avMB < 50.0);
+
+    // watchdog 判据：死前主线程刚经历过长卡顿（>2s 已进入被盯上的区间）。
+    BOOL watchdogSuspect = (stall >= 2000.0);
+
+    NSString *tail = [NSString stringWithFormat:
+                      @"（证据：终止前进程占用 %.0fMB / 峰值 %.0fMB，"
+                      @"系统可用 %.0fMB，主线程最后一次卡顿 %.0fms）",
+                      fpMB, peakMB, avMB, stall];
+
+    if (oomSuspect && watchdogSuspect) {
+        return [@"高度疑似被系统终止：内存压力与主线程长卡顿同时成立，"
+                @"OOM 与 watchdog 均需在查" stringByAppendingString:tail];
+    }
+    if (oomSuspect) {
+        return [@"疑似 OOM（内存被系统杀死）：优先查内存大户，"
+                @"尤其视频缓存 / 直播页 / 特效" stringByAppendingString:tail];
+    }
+    if (watchdogSuspect) {
+        return [@"疑似 watchdog（主线程长时间无响应后被杀）："
+                @"优先查主线程阻塞源" stringByAppendingString:tail];
+    }
+    return [@"疑似闪退但无明显内存/卡顿线索：可能是极早期崩溃"
+            @"（崩溃捕获尚未安装完成）或被其他模块终止" stringByAppendingString:tail];
 }
 
 /// 同上，但是英文版 —— 专供 plugin_runtime.log 使用。
