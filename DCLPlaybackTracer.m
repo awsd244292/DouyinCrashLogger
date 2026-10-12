@@ -305,20 +305,29 @@ static void dcl_sendEvent(id self, SEL _cmd, UIEvent *event) {
         // AVFoundation 层：AVPlayer 是所有视频播放的汇聚点，继承自它的自研播放器自动被覆盖
         Class playerCls = NSClassFromString(@"AVPlayer");
         if (playerCls) {
-            if (DCLReplaceInstanceMethod(playerCls, @selector(pause), "v@:", (void *)dcl_pause, (void **)&dcl_orig_pause_fn)) g_hook_count++;
-            if (DCLReplaceInstanceMethod(playerCls, @selector(play), "v@:", (void *)dcl_play, (void **)&dcl_orig_play_fn)) g_hook_count++;
-            if (DCLReplaceInstanceMethod(playerCls, @selector(setRate:), "v@f", (void *)dcl_setRate, (void **)&dcl_orig_setRate_fn)) g_hook_count++;
+            // typeEncoding 一律传 NULL：沿用宿主的真实编码（"v16@0:8" 这类带偏移的写法），
+            // 手写 "v@:" 会把 runtime 里的方法签名改掉，是没必要又难以察觉的风险。
+            if (DCLReplaceInstanceMethod(playerCls, @selector(pause), NULL, (void *)dcl_pause, (void **)&dcl_orig_pause_fn)) g_hook_count++;
+            if (DCLReplaceInstanceMethod(playerCls, @selector(play), NULL, (void *)dcl_play, (void **)&dcl_orig_play_fn)) g_hook_count++;
+            if (DCLReplaceInstanceMethod(playerCls, @selector(setRate:), NULL, (void *)dcl_setRate, (void **)&dcl_orig_setRate_fn)) g_hook_count++;
             if (DCLReplaceInstanceMethod(playerCls, @selector(replaceCurrentItemWithPlayerItem:),
-                             "v@@", (void *)dcl_replaceItem, (void **)&dcl_orig_replaceItem_fn)) g_hook_count++;
+                             NULL, (void *)dcl_replaceItem, (void **)&dcl_orig_replaceItem_fn)) g_hook_count++;
         }
 
-        // 触摸入口：唯一的额外动作就是打个时间戳
-        Class uiAppCls = NSClassFromString(@"UIApplication");
-        if (uiAppCls) {
-            if (DCLReplaceInstanceMethod(uiAppCls, @selector(sendEvent:), "v@@",
-                             (void *)dcl_sendEvent, (void **)&dcl_orig_sendEvent_fn)) {
-                g_hook_count++;
-            }
+        // 触摸入口：唯一的额外动作就是打个时间戳。
+        // 挂载层同样要从「当前 App 实例」向上找真正实现 sendEvent: 的那一层 ——
+        // 宿主用自定义 UIApplication 子类重写它的话，只钩 UIApplication 本类是收不到事件的。
+        Class appRootCls = NSClassFromString(@"UIApplication");
+        id app = nil;
+        if (appRootCls && [appRootCls respondsToSelector:@selector(sharedApplication)]) {
+            app = [appRootCls sharedApplication];
+        }
+        Class eventOwner = DCLMostDerivedMethodOwner(app, @selector(sendEvent:), appRootCls)
+                           ?: appRootCls;
+        if (eventOwner &&
+            DCLReplaceInstanceMethod(eventOwner, @selector(sendEvent:), NULL,
+                                     (void *)dcl_sendEvent, (void **)&dcl_orig_sendEvent_fn)) {
+            g_hook_count++;
         }
     } @catch (id e) {
         (void)e;

@@ -38,11 +38,29 @@ def find_line(src, pattern):
     return None, ""
 
 
+def strip_comments(src):
+    """去掉 ObjC 注释。
+
+    判「某 API 还在不在」时必须先剥注释 —— 注释里写一句「不再 freopen」
+    就能让检查报错，那是假的失败；反之若注释写了不存在的代码也会被误判通过。
+    """
+    src = re.sub(r"//[^\n]*", "", src)
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    return src
+
+
 crash = read("DCLCrashReporter.m")
 watch = read("DCLWatchdog.m")
 trace = read("DCLPlaybackTracer.m")
 main = read("DCLMain.m")
 health = read("DCLHealthCheck.m")
+hot = read("DCLHotSwitch.m")
+logger_src = read("DCLLogger.m")
+support = read("DCLSupport.m")
+
+# 所有「装了钩子」的文件：新模块的文件必须一并纳入，
+# 否则每加一个模块就多一块审查盲区（DCLHotSwitch 就是这么逃避一轮检查的）。
+hook_src_all = "\n".join([trace, hot])
 
 # ============================================================
 # 路径 A：信号处理器
@@ -97,18 +115,22 @@ check("A5", "处理器内无符号化/OC/分配", not unsafe,
 # 路径 B：方法交换
 # ============================================================
 
-hook_fns = re.findall(r"static void (dcl_\w+)\(id self, SEL _cmd[^{]*\{(.*?)\n\}", trace, re.S)
+hook_fns = re.findall(r"static void (dcl_\w+)\(id self, SEL _cmd[^{]*\{(.*?)\n\}", hook_src_all, re.S)
 all_passthrough = True
 bad_hooks = []
 for name, body in hook_fns:
-    if name in ("dcl_sendEvent",):
-        if "dcl_orig_sendEvent_fn(self, _cmd, event)" not in body:
-            all_passthrough = False
-            bad_hooks.append(name)
-    elif not re.search(r"dcl_orig_\w+_fn\(self, _cmd", body):
-        all_passthrough = False
-        bad_hooks.append(name)
-check("B1", "所有钩子无条件透传原实现", all_passthrough and len(hook_fns) >= 5,
+    # 透传判据泛化：钩子体必须调用自己那条 orig 指针。
+    # 之前写死了 dcl_orig_*_fn 的名字，于是热切换模块的 dcl_hs_orig_sendEvent
+    # 会被当成「没透传」或干脆被豁免 —— 两种都不是我们想要的。
+    if "dcl_orig_sendEvent_fn(self, _cmd, event)" in body and name == "dcl_sendEvent":
+        continue
+    if "dcl_hs_orig_sendEvent(self, _cmd, event)" in body and name == "dcl_hs_sendEvent":
+        continue
+    if re.search(r"dcl_orig_\w+_fn\(self, _cmd", body):
+        continue
+    all_passthrough = False
+    bad_hooks.append(name)
+check("B1", "所有钩子无条件透传原实现", all_passthrough and len(hook_fns) >= 6,
       f"钩子数 {len(hook_fns)}，未透传: {bad_hooks or '无'}",
       "钩子体提前 return 或漏调原实现 = 吞掉宿主行为，直接改变 App 功能")
 
@@ -182,6 +204,64 @@ sync_only_bg = bool(re.search(r"mustBeSync\s*=\s*.*后台", crash))
 check("C4", "全线程快照不在主线程同步执行", async_snap and sync_only_bg,
       "已按场景分流：进后台同步，其余异步到串行队列" if async_snap else "全部在主线程同步执行",
       "截屏通知在主线程，同步 suspend 全部线程会卡住 UI，且主线程与挂起线程争锁风险更高")
+
+# ============================================================
+# 路径 D：日志管线（新模块 DCLLogger）
+# 它不改动宿主任何行为，但有能力把宿主拖死 / 写爆磁盘，故纳入影响面。
+# ============================================================
+
+# D1 管道写端必须非阻塞
+nonblock = "O_NONBLOCK" in logger_src
+check("D1", "stderr 管道写端设为 O_NONBLOCK", nonblock,
+      "fcntl(F_SETFL, O_NONBLOCK) 已设置" if nonblock else "未找到非阻塞设置",
+      "写端阻塞 + 泵线程掉线 = 宿主在 UI 线程上 fprintf(stderr) 时被无限阻塞 —— 反向把抖音卡死")
+
+# D2 泵线程退出时必须把宿主原来的输出通道还回去
+restore = bool(re.search(r"dup2\(\s*g_saved_err\s*,\s*STDERR_FILENO\s*\)", logger_src))
+check("D2", "泵线程退出前恢复宿主原始 stderr/stdout", restore,
+      "存在 dup2(g_saved_err, STDERR_FILENO) 恢复逻辑" if restore else "未找到恢复逻辑",
+      "接管了宿主的 stderr 却不还原，等于永久致盲宿主的日志通道 —— 不可逆破坏")
+
+# D3 不再用 freopen 把 stderr 直接怼进文件（那样无法控体积、无法过滤）
+still_freopen = "freopen" in strip_comments(crash + main + logger_src)
+check("D3", "未使用 freopen 直写 stderr 到日志", not still_freopen,
+      "改用 pipe + 后台泵" if not still_freopen else "仍在 freopen",
+      "freopen 把宿主所有输出原盘照收，没有任何过滤/限流机会 —— 这正是日志失控的根因")
+
+# D4 单会话有大小上限，且写路径真的会触发裁剪
+cap = bool(re.search(r"DCLRuntimeLogMaxBytes\s*=\s*\d+", logger_src))
+trims = bool(re.search(r"dcl_trim_file_to_tail_locked", logger_src))
+check("D4", "单会话日志有大小上限并会真的裁剪", cap and trims,
+      "存在上限常量与裁剪调用" if (cap and trims) else "缺上限或裁剪调用",
+      "没有上限就是替宿主把磁盘写满；只有常量没有调用点等于没设")
+
+# D5 写盘全部走后台串行队列，不在调用方线程上同步 IO
+async_write = bool(re.search(r"dispatch_async\(\s*dcl_log_queue\(\)", logger_src))
+check("D5", "日志写盘异步到后台串行队列", async_write,
+      "appendRuntimeLine 走 dispatch_async(队列)" if async_write else "可能同步写盘",
+      "钩子/通知回调里同步写盘会在宿主关键路径上叠加磁盘 IO，抖动直接表现为卡顿")
+
+# ============================================================
+# 路径 E：Hook 必须走统一入口（防止后来者绕过守卫）
+# ============================================================
+
+# E1 业务模块不得直接调用 class_replaceMethod —— 三件事（只换自有实现、
+#    取原实现透传、防自环）必须由 DCLReplaceInstanceMethod 统一保证
+direct_replace = []
+for fname, src in (("DCLHotSwitch.m", hot), ("DCLPlaybackTracer.m", trace)):
+    if re.search(r"class_replaceMethod", src):
+        direct_replace.append(fname)
+check("E1", "<｜hy_place▁holder▁no▁813｜>方法替换统一走 DCLReplaceInstanceMethod", not direct_replace,
+      "绕过的文件: " + ", ".join(direct_replace) if direct_replace else "无直接调用",
+      "手写 class_replaceMethod 极易漏掉“本类是否自有实现 / 取不到原实现怎么办”两步，"
+      "漏一步就是把父类的实现换掉或把宿主方法吞了")
+
+# E2 手写方法签名是否被填 NULL（沿用宿主真实编码）
+hand_enc = re.findall(r"DCLReplaceInstanceMethod\([^;]*?\"[v@csiIlLqQfdB#:*]+\"", trace + hot)
+check("E2", "替换时不手写 type encoding", not hand_enc,
+      f"发现 {len(hand_enc)} 处手写编码" if hand_enc else "全部传 NULL 沿用宿主编码",
+      "手写的 \"v@:\" 会把 runtime 里的真实签名（带偏移，如 v16@0:8）改掉，"
+      "在结构体返回/参数传递上可能引发难以定位的 ABI 问题")
 
 # ============================================================
 # 输出

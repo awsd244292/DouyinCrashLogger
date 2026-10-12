@@ -32,6 +32,17 @@ BOOL DCLClassOwnsInstanceMethod(Class cls, SEL sel) {
     return owned;
 }
 
+Class _Nullable DCLMostDerivedMethodOwner(id obj, SEL sel, Class _Nullable stopAtInclusive) {
+    if (!obj || !sel) return Nil;
+    Class cls = object_getClass(obj);   // 实例真实所属类（含可能的 KVO 动态子类）
+    while (cls) {
+        if (DCLClassOwnsInstanceMethod(cls, sel)) return cls;
+        if (stopAtInclusive && cls == stopAtInclusive) break;
+        cls = class_getSuperclass(cls);
+    }
+    return Nil;
+}
+
 BOOL DCLReplaceInstanceMethod(Class cls,
                               SEL sel,
                               const char * _Nullable typeEncoding,

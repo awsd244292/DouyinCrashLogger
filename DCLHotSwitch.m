@@ -181,23 +181,38 @@ static void dcl_hs_sendEvent(id self, SEL _cmd, UIEvent *event) {
 + (void)install {
     if (__sync_fetch_and_or(&dcl_hs_installed, 1)) return;
     @try {
+        SEL selEvent = @selector(sendEvent:);
+
         // 第一选择：UIApplication sendEvent: —— 所有触摸事件的唯一总入口。
-        // 只有它才能让检测「挂得满」：钩子落在 UIView 上会被无数子类重写挡掉，这是上一版失效的真因。
-        Class appCls = NSClassFromString(@"UIApplication");
-        if (appCls) {
-            if (DCLReplaceInstanceMethod(appCls, @selector(sendEvent:), "v@@",
-                                         (void *)dcl_hs_sendEvent,
-                                         (void **)&dcl_hs_orig_sendEvent)) {
-                dcl_hs_install_target = @"UIApplication";
-                dcl_hs_install_succeeded = 1;
-                [DCLLogger appendRuntimeLine:@"[DCL] hotswitch: installed on UIApplication sendEvent:"];
-                return;
-            }
+        // 挂在 UIView touchesEnded:withEvent: 上会被无数子类重写挡掉，那是上一版失效的真因。
+        //
+        // 注意取哪一层：不是无脑取 UIApplication 本类，而是从「当前 App 实例」向上找
+        // 真正实现这个方法的那一层（宿主可能用自定义 UIApplication 子类重写了它）。
+        // 详见 DCLMostDerivedMethodOwner 的说明。
+        id app = nil;
+        Class appRootCls = NSClassFromString(@"UIApplication");
+        if (appRootCls &&
+            [appRootCls respondsToSelector:@selector(sharedApplication)]) {
+            app = [appRootCls sharedApplication];
         }
-        // 兜底：宿主若给 UIApplication 换了自定义实现收不到（极罕见），退到 UIWindow
+        Class targetCls = DCLMostDerivedMethodOwner(app, selEvent, appRootCls) ?: appRootCls;
+        if (targetCls &&
+            DCLReplaceInstanceMethod(targetCls, selEvent, NULL,
+                                     (void *)dcl_hs_sendEvent,
+                                     (void **)&dcl_hs_orig_sendEvent)) {
+            dcl_hs_install_target = NSStringFromClass(targetCls);
+            dcl_hs_install_succeeded = 1;
+            [DCLLogger appendRuntimeLine:
+             [NSString stringWithFormat:@"[DCL] hotswitch: installed sendEvent: hook on %@",
+              NSStringFromClass(targetCls)]];
+            return;
+        }
+
+        // 兜底：拿不到 UIApplication 实例时退回到 UIWindow（每个窗口都会经手事件，
+        // 覆盖比 UIApplication 略窄，但总比完全没有监听强）。
         Class winCls = NSClassFromString(@"UIWindow");
         if (winCls) {
-            if (DCLReplaceInstanceMethod(winCls, @selector(sendEvent:), "v@@",
+            if (DCLReplaceInstanceMethod(winCls, selEvent, NULL,
                                          (void *)dcl_hs_sendEvent,
                                          (void **)&dcl_hs_orig_sendEvent)) {
                 dcl_hs_install_target = @"UIWindow";

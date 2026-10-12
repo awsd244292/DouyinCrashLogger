@@ -35,6 +35,15 @@ uint64_t DCLNowUs(void);
 /// 那是会波及所有子类的实质破坏，替换前必须先问这一句。
 BOOL DCLClassOwnsInstanceMethod(Class cls, SEL sel);
 
+/// 从实例的真实所属类出发、沿继承链向上，找到「最靠下」的那个真正实现了 sel 的类。
+///
+/// 为什么不能永远只钩 UIApplication 本类：宿主完全可能写一个 UIApplication 子类并
+/// 重写 sendEvent: —— 那时消息会直接落进子类的实现，根本不路过我们替换掉的那个
+/// 「父类」实现（除非子类恰好调用了 [super sendEvent:]，而调不调、什么时候调都不由
+/// 我们决定）。沿着「实例 → 真实类 → 拥有该实现的那一层」去找，才钩得住真正会被
+/// 派发到的位置。stopAtInclusive 用于把搜索范围卡死在某个基类以内。
+Class _Nullable DCLMostDerivedMethodOwner(id obj, SEL sel, Class _Nullable stopAtInclusive);
+
 /// 唯一的实例方法替换入口，替各模块把三件事做全：
 ///   1) 只换本类自有实现，绝不碰父类（换到父类 = 影响全部子类）；
 ///   2) 取原 IMP 交给调用方透传 —— 取不到就宁可不挂，绝不可吞掉宿主行为；
