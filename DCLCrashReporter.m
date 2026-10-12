@@ -249,7 +249,9 @@ static void dcl_write_report_c(const char *type, const char *detail,
         dcl_write_all(fd, detail);
         dcl_write_all(fd, "\n");
     }
-    dcl_write_all(fd, "\n--- Loaded images (base -> module) ---\n");
+    dcl_write_all(fd, "\n--- Binary Images (苹果报告同格式，可直接喂给 atos / symbolicatecrash) ---\n");
+    dcl_write_all(fd, "符号化用法：atos -o <可执行文件.dSYM/可执行文件> -l <起始地址> -arch arm64 <栈地址...>\n");
+    dcl_write_all(fd, "           行首为加载地址区间，UUID 用于核对 dSYM 是否同一次构建产物 —— 务必先比对。\n");
     dcl_write_all(fd, g_image_table);
     dcl_write_all(fd, "\n--- Backtrace (crashed thread, raw addresses) ---\n");
     dcl_write_backtrace(fd, frames, nframes);
@@ -489,8 +491,82 @@ static BOOL dcl_reassert_signals(void) {
 
 #pragma mark - 镜像基址表预收集（非崩溃上下文，供崩溃日志映射地址）
 
+/// 读出镜像的 __TEXT 段大小，用于算出结束地址。取不到返回 0。
+static uint64_t dcl_image_text_size(const struct mach_header *hdr) {
+    if (!hdr) return 0;
+    const uint8_t *base = (const uint8_t *)hdr;
+    uint32_t ncmds = 0;
+    size_t off = 0;
+    if (hdr->magic == MH_MAGIC_64) {
+        ncmds = ((const struct mach_header_64 *)hdr)->ncmds;
+        off = sizeof(struct mach_header_64);
+    } else if (hdr->magic == MH_MAGIC) {
+        ncmds = hdr->ncmds;
+        off = sizeof(struct mach_header);
+    } else {
+        return 0;
+    }
+
+    const struct load_command *lc = (const struct load_command *)(base + off);
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if (lc->cmdsize < 8) break;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strncmp(seg->segname, "__TEXT", 6) == 0) return seg->vmsize;
+        } else if (lc->cmd == LC_SEGMENT) {
+            const struct segment_command *seg = (const struct segment_command *)lc;
+            if (strncmp(seg->segname, "__TEXT", 6) == 0) return (uint64_t)seg->vmsize;
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    return 0;
+}
+
+/// 取出镜像的 LC_UUID（32 位十六进制，带连字符）。写进 out[37]，成功返回 1。
+///
+/// UUID 是符号化这座桥的另一头：atos / symbolicatecrash 靠它匹配 dSYM。
+/// 没有它，同一份可执行文件改一个字节就可能对不上符号表，
+/// 而崩溃报告里那些裸地址也就永远只是裸地址。
+static int dcl_image_uuid_string(const struct mach_header *hdr, char out[37]) {
+    if (!hdr) return 0;
+    const uint8_t *base = (const uint8_t *)hdr;
+    uint32_t ncmds = 0;
+    size_t off = 0;
+    if (hdr->magic == MH_MAGIC_64) {
+        ncmds = ((const struct mach_header_64 *)hdr)->ncmds;
+        off = sizeof(struct mach_header_64);
+    } else if (hdr->magic == MH_MAGIC) {
+        ncmds = hdr->ncmds;
+        off = sizeof(struct mach_header);
+    } else {
+        return 0;
+    }
+
+    const struct load_command *lc = (const struct load_command *)(base + off);
+    for (uint32_t i = 0; i < ncmds; i++) {
+        if (lc->cmdsize < 8) break;
+        if (lc->cmd == LC_UUID) {
+            const struct uuid_command *uc = (const struct uuid_command *)lc;
+            const uint8_t *u = uc->uuid;
+            snprintf(out, 37,
+                     "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                     u[0],  u[1],  u[2],  u[3],  u[4],  u[5],  u[6],  u[7],
+                     u[8],  u[9],  u[10], u[11], u[12], u[13], u[14], u[15]);
+            return 1;
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    return 0;
+}
+
 // 启动时收集所有已加载镜像的基址与路径，写入 g_image_table。
 // 信号处理路径只只读该缓冲区，不调用 dladdr（非 async-signal-safe）。
+//
+// 输出格式刻意对齐苹果官方崩溃报告里的 Binary Images 段：
+//   0x<起始地址> - 0x<结束地址> <架构> <UUID> <镜像名> <完整路径>
+// 对齐不是强迫症 —— macOS 上的一众符号化工具（atos、symbolicatecrash、
+// 各种 GUI 查看器）都认这个排布，照抄一遍，用户拿到报告就能直接喂给它们，
+// 不必先在脑子里做一次格式转换。
 static void dcl_prepare_images(void) {
     uint32_t cnt = _dyld_image_count();
     g_image_count = cnt;
@@ -499,12 +575,32 @@ static void dcl_prepare_images(void) {
         const struct mach_header *hdr = _dyld_get_image_header(i);
         const char *name = _dyld_get_image_name(i);
         if (!hdr || !name) continue;
+
+        uint64_t start = (uint64_t)(uintptr_t)hdr;
+        uint64_t size = dcl_image_text_size(hdr);
+        uint64_t end = (size > 0) ? (start + size - 1) : start;
+
+        const char *arch = "unknown";
+        cpu_type_t cpu = hdr->cputype;
+        if (cpu == CPU_TYPE_ARM64)    arch = "arm64";
+        else if (cpu == CPU_TYPE_ARM) arch = "armv7";
+        else if (cpu == CPU_TYPE_X86_64) arch = "x86_64";
+
+        char uuid[37] = "<no-uuid>";
+        if (!dcl_image_uuid_string(hdr, uuid)) {
+            snprintf(uuid, sizeof(uuid), "<00000000-0000-0000-0000-000000000000>");
+        }
+
+        const char *baseName = strrchr(name, '/');
+        baseName = baseName ? baseName + 1 : name;
+
         int n = snprintf(g_image_table + off, sizeof(g_image_table) - off,
-                         "Image %u 0x%llx %s\n", i,
-                         (unsigned long long)(uintptr_t)hdr, name);
+                         "0x%llx - 0x%llx %s %s %s %s\n",
+                         (unsigned long long)start, (unsigned long long)end,
+                         arch, uuid, baseName, name);
         if (n < 0) break;
         off += (size_t)n;
-        if (off >= sizeof(g_image_table) - 128) break;
+        if (off >= sizeof(g_image_table) - 256) break;
     }
 }
 
