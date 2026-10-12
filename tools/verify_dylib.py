@@ -37,11 +37,14 @@ REQUIRED_CLASSES = [
     "DCLHealthCheck", "DCLConfig", "DCLHotSwitch", "DCLLogger",
 ]
 # 纯 C 模块的关键符号（证明模块已参与构建）
+# 注意：static 函数（如 dcl_watchdog_main）不会有全局符号，不可用于校验，
+#       这里只列导出可见的 C 符号。
 REQUIRED_SYMBOLS = [
-    "DCLNowUs",                 # DCLSupport：微秒时钟
-    "DCLMostDerivedMethodOwner",# DCLSupport：方法替换定位
-    "DCLASCIISanitized",        # DCLSupport：ASCII 净化
-    "dcl_watchdog_main",        # DCLWatchdog：看门狗泵线程
+    "DCLNowUs",                  # DCLSupport：微秒时钟
+    "DCLMostDerivedMethodOwner", # DCLSupport：方法替换定位
+    "DCLASCIISanitized",         # DCLSupport：ASCII 净化
+    "dcl_signal_handler",        # DCLCrashReporter：信号处理器
+    "dcl_uncaught_exception_handler",  # DCLCrashReporter：OC 异常处理器
 ]
 
 results = []
