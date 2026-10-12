@@ -18,7 +18,7 @@ STRIP = echo
 #   DCLPlaybackTracer.m  —— 视频暂停归因探针（hook AVPlayer / UIApplication.sendEvent:）
 #   DCLHealthCheck.m     —— 触发式健康自检（证明插件自身在工作）
 #   DCLConfig.m          —— 两档采集方案开关（A 零 hook / B hook 全开），决定后两者装不装
-#   DCLHotSwitch.m       —— 三指轻点热切换（始终安装，独立于档位，免文件免重启）
+#   DCLHotSwitch.m       —— 摇一摇热切换（始终安装，独立于档位，免文件免重启）
 #   DCLLogger.m          —— 日志管家：按会话轮转、大小闸门、噪音折叠、ASCII 净化、stderr 接管
 #   DCLSupport.m         —— 公共底层工具（微秒时钟 / 类自有方法判定 / 安全方法替换 / ASCII 净化）
 DouyinCrashLogger_FILES := DCLMain.m DCLConstants.m DCLCrashReporter.m DCLWatchdog.m DCLPlaybackTracer.m DCLHealthCheck.m DCLConfig.m DCLHotSwitch.m DCLLogger.m DCLSupport.m

@@ -343,11 +343,11 @@
     return it;
 }
 
-/// 10) 三指热切换监听是否挂上。三指没反应时，这一项是第一现场：
-///     先看「监听有没有挂上」，再谈「有没有震动」。
+/// 10) 摇一摇热切换监听是否挂上。摇了没反应时，这一项是第一现场：
+///     先看「监听有没有挂上」，再谈「有没有提示」。
 + (DCLHealthItem *)checkHotSwitch {
     DCLHealthItem *it = [DCLHealthItem new];
-    it.name = @"三指热切换监听";
+    it.name = @"摇一摇热切换监听";
     @try {
         BOOL ok = [DCLHotSwitch isInstalled];
         it.level = ok ? DCLHealthLevelPass : DCLHealthLevelWarn;

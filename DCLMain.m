@@ -70,7 +70,7 @@ __attribute__((constructor)) static void dcl_entry(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @try {
-            // 热切换：三指轻点 → 翻转 safe/full → 震 3 下。始终安装、独立于档位，
+            // 热切换：摇一摇 → 翻转 safe/full → 轻提示 + 三连触感。始终安装、独立于档位，
             // 否则 safe 档下用户将无法切到 full（详见 DCLHotSwitch.h）。
             [DCLHotSwitch install];
 

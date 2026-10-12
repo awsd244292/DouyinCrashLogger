@@ -30,7 +30,7 @@
 //  切换方式（二选一）：
 //   1) 编辑沙盒内 Documents/DouyinCrashLogs/capture_mode.txt，
 //      内容写 full 或 safe（# 开头的注释行与空行会被忽略），完全退出并重启抖音生效。
-//   2) App 内三指轻点：直接翻转档位，震 3 下反馈，免文件、免重启（详见 DCLHotSwitch）。
+//   2) App 内摇一摇：直接翻转档位，顶部轻提示 + 三连触感，免文件、免重启（详见 DCLHotSwitch）。
 //  文件不存在时按 safe 运行，并在首次运行时自动生成一份带说明的默认文件，方便直接改。
 //
 //  设计铁律：无论哪一档，捕获链路（信号 / 异常处理器）都始终安装 ——
@@ -79,7 +79,7 @@ typedef NS_ENUM(NSUInteger, DCLCaptureProfile) {
 /// 双写 NSUserDefaults 与 capture_mode.txt —— 即使完全退出重启抖音也保持生效。
 + (void)setProfile:(DCLCaptureProfile)profile;
 
-/// 在 safe / full 之间翻转（三指轻点热切换入口）
+/// 在 safe / full 之间翻转（摇一摇热切换入口）
 + (void)toggleProfile;
 
 @end
