@@ -93,7 +93,7 @@ echo "    SDK = $SDK_SYSROOT (sdk $SDK_VER_NUM)"
 echo "==> [3/5] 编译（$ARCH, min iOS $MIN_IOS）"
 FILES="DCLMain.m DCLConstants.m DCLCrashReporter.m DCLWatchdog.m DCLPlaybackTracer.m \
 DCLHealthCheck.m DCLConfig.m DCLHotSwitch.m DCLLogger.m DCLSupport.m \
-DCLTimeline.m DCLSystemSignal.m DCLTimelinePersist.m DCLResourceProbe.m"
+DCLTimeline.m DCLSystemSignal.m DCLTimelinePersist.m DCLResourceProbe.m DCLProbeCost.m"
 
 rm -rf "$BUILD"; mkdir -p "$BUILD" "$(dirname "$OUT")"
 OBJS=()

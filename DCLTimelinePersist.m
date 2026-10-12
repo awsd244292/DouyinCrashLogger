@@ -18,6 +18,7 @@
 #import "DCLTimelinePersist.h"
 #import "DCLTimeline.h"
 #import "DCLSupport.h"   // async-signal-safe 文本拼接：不在本文件里再抄一份
+#import "DCLProbeCost.h"
 
 #import <dispatch/dispatch.h>
 #import <fcntl.h>
@@ -148,11 +149,17 @@ void DCLTimelineEmergencyDump(const char *path) {
 static NSUInteger dcl_tlp_append_new(void) {
     if (!g_main_path) return 0;
 
+    uint64_t t0 = DCLTimelineMonoNow();
+
     NSUInteger cap = DCL_TL_CAPACITY;
     DCLTimelineEntry *buf = (DCLTimelineEntry *)calloc(cap, sizeof(DCLTimelineEntry));
     if (!buf) return 0;
     NSUInteger n = [DCLTimeline copyEntries:buf capacity:cap];
-    if (n == 0) { free(buf); return 0; }
+    if (n == 0) {
+        free(buf);
+        DCLProbeCostRecordC("时间线.落盘", (double)(DCLTimelineMonoNow() - t0) / 1000000.0);
+        return 0;
+    }
 
     NSFileManager *fm = [NSFileManager defaultManager];
 
@@ -189,7 +196,10 @@ static NSUInteger dcl_tlp_append_new(void) {
     }
     free(buf);
 
-    if (written == 0) return 0;
+    if (written == 0) {
+        DCLProbeCostRecordC("时间线.落盘", (double)(DCLTimelineMonoNow() - t0) / 1000000.0);
+        return 0;
+    }
 
     NSData *data = [chunk dataUsingEncoding:NSUTF8StringEncoding];
     // 已存在 → 追加；不存在 → 直接落一个新文件。
@@ -204,7 +214,10 @@ static NSUInteger dcl_tlp_append_new(void) {
         [data writeToFile:g_main_path atomically:NO];
     }
 
+    const char *DCLProbeCostRecordCName = "时间线.落盘";
     g_last_seq = maxSeq;
+    DCLProbeCostRecordC(DCLProbeCostRecordCName,
+                        (double)(DCLTimelineMonoNow() - t0) / 1000000.0);
     return written;
 }
 

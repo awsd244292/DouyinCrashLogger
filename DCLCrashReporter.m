@@ -16,6 +16,7 @@
 #import "DCLSystemSignal.h"
 #import "DCLTimelinePersist.h"
 #import "DCLResourceProbe.h"
+#import "DCLProbeCost.h"
 #import "DCLHealthCheck.h"
 
 #import <UIKit/UIKit.h>
@@ -1252,6 +1253,17 @@ static void dcl_prepare_meta(void) {
     if (crashTl.length) {
         [s appendString:@"\n---------- 上次崩溃前的最后现场（崩溃瞬间抢出，非推测）----------\n"];
         [s appendFormat:@"%@\n", crashTl];
+    }
+
+    // 探针自身开销。必须放在报告里显眼处 —— 它回答的是「这些日志值不值得信」：
+    // 一个把自己变成卡顿源的探针，产出的取证结论本身就需要打折。
+    NSArray<NSString *> *costLines = [DCLProbeCost reportLines];
+    [s appendString:@"\n---------- 探针自身开销 ----------\n"];
+    if (costLines.count == 0) {
+        [s appendString:@"（尚未记录到探针耗时）\n"];
+    } else {
+        for (NSString *l in costLines) [s appendFormat:@"%@\n", l];
+        [s appendFormat:@"结论：%@\n", [DCLProbeCost verdictLine]];
     }
 }
 

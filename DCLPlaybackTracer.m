@@ -8,6 +8,7 @@
 #import "DCLSupport.h"   // DCLNowUs / DCLReplaceInstanceMethod —— 不再各模块自己抄一份
 #import "DCLTimeline.h"  // 所有探针共用同一条时间线 —— 事件必须能在同一条轴上比对
 #import "DCLSystemSignal.h"  // 复用 AVPlayer 子类枚举（只读 runtime，零 hook）
+#import "DCLProbeCost.h"     // 探针自身开销度量 —— 不记账就只能靠猜
 
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -285,8 +286,15 @@ static inline void dcl_capture(id player, NSString *action, const char *clsName,
         // 栈上缓冲：绝不能用 static —— AVPlayer 的回调常在非主线程并发触发，
         // 静态缓冲会被多个线程同时写，采出来的栈是几路调用混在一起的假栈，
         // 基于它做的归因会指向完全错误的方向。
+        //
+        // 顺手给「回溯」这记重活计时：它是钩子体里唯一可能拖慢宿主的环节。
+        // 不记账就只能靠猜 —— 而上一次冻屏的锅很可能就在这里。
+        uint64_t bt_begin = DCLTimelineMonoNow();
         void *frames[DCL_BT_DEPTH];
         int n = backtrace(frames, DCL_BT_DEPTH);
+        DCLProbeCostRecordC("钩子.栈回溯",
+                            (double)(DCLTimelineMonoNow() - bt_begin) / 1000000.0);
+
         BOOL onMain = [NSThread isMainThread];
         dcl_enqueue(action, clsName, before, after, onMain, now, frames, n);
     }
