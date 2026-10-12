@@ -7,6 +7,7 @@
 #import "DCLConfig.h"
 
 #import "DCLCrashReporter.h"
+#import "DCLSupport.h"   // DCLNowUs：全插件统一的微秒时钟实现
 
 #import <dlfcn.h>
 #import <mach/mach.h>
@@ -66,11 +67,7 @@ static const useconds_t kSampleIntervalUs = 500 * 1000;
 
 #define DCL_MAX_FRAMES 40
 
-static uint64_t dcl_now_us(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-}
+
 
 #if __has_feature(ptrauth_calls)
 static inline uint64_t dcl_strip(uint64_t p) {
@@ -120,7 +117,7 @@ static BOOL dcl_deep_evidence(void) {
 #pragma mark - RunLoop 观察者（主线程唯一的额外负担）
 
 static void dcl_loop_activity(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info) {
-    g_main_heartbeat_us = dcl_now_us();
+    g_main_heartbeat_us = DCLNowUs();
     g_last_activity = activity;
 }
 
@@ -400,7 +397,7 @@ static void dcl_watchdog_main(void) {
     NSArray<NSString *> *lastStack = nil;
 
     for (;;) {
-        g_watchdog_alive_us = dcl_now_us();
+        g_watchdog_alive_us = DCLNowUs();
         usleep(kPollIntervalUs);
 
         if (g_backgrounded) { stallStart = 0; samples = 0; continue; }
@@ -411,7 +408,7 @@ static void dcl_watchdog_main(void) {
 
         // 主线程正在 mach_msg 休眠 = 合法空闲，不判定卡顿
         BOOL idle = (act == kCFRunLoopBeforeWaiting || act == kCFRunLoopExit);
-        uint64_t now = dcl_now_us();
+        uint64_t now = DCLNowUs();
         BOOL stuck = (!idle && (now - hb) > kStallThresholdUs);
 
         if (stuck && stallStart == 0) {
@@ -492,7 +489,7 @@ static void dcl_watchdog_main(void) {
     if (__sync_fetch_and_or(&g_installed, 1)) return;
     @try {
         g_main_thread = mach_thread_self();
-        g_main_heartbeat_us = dcl_now_us();
+        g_main_heartbeat_us = DCLNowUs();
         g_stalls = [NSMutableArray array];
 
         CFRunLoopObserverContext ctx = {0, NULL, NULL, NULL, NULL};
@@ -510,7 +507,7 @@ static void dcl_watchdog_main(void) {
                                                       object:nil];
         g_watchdog_thread.name = @"DCLWatchdog";
         g_watchdog_thread.qualityOfService = NSQualityOfServiceBackground;
-        g_watchdog_alive_us = dcl_now_us();
+        g_watchdog_alive_us = DCLNowUs();
         [g_watchdog_thread start];
     } @catch (id e) {
         (void)e;
@@ -530,7 +527,7 @@ static void dcl_watchdog_main(void) {
 }
 
 + (void)noteTouch {
-    g_last_touch_us = dcl_now_us();
+    g_last_touch_us = DCLNowUs();
 }
 
 + (NSTimeInterval)lastTouchUnix {
@@ -539,22 +536,22 @@ static void dcl_watchdog_main(void) {
 }
 
 + (void)pauseForBackground  { __sync_fetch_and_or(&g_backgrounded, 1); }
-+ (void)resumeFromForeground { __sync_fetch_and_and(&g_backgrounded, 0); g_main_heartbeat_us = dcl_now_us(); }
++ (void)resumeFromForeground { __sync_fetch_and_and(&g_backgrounded, 0); g_main_heartbeat_us = DCLNowUs(); }
 
 + (BOOL)isRunning {
     uint64_t t = g_watchdog_alive_us;
     if (!t) return NO;
-    return (dcl_now_us() - t) < 3 * 1000000ULL;
+    return (DCLNowUs() - t) < 3 * 1000000ULL;
 }
 
 + (double)watchdogHeartbeatAgeSec {
     uint64_t t = g_watchdog_alive_us;
-    return t ? (double)(dcl_now_us() - t) / 1000000.0 : -1.0;
+    return t ? (double)(DCLNowUs() - t) / 1000000.0 : -1.0;
 }
 
 + (double)mainLoopHeartbeatAgeSec {
     uint64_t t = g_main_heartbeat_us;
-    return t ? (double)(dcl_now_us() - t) / 1000000.0 : -1.0;
+    return t ? (double)(DCLNowUs() - t) / 1000000.0 : -1.0;
 }
 
 + (NSUInteger)stallCount {
@@ -577,11 +574,11 @@ static void dcl_watchdog_main(void) {
     // 可能被优化成「读一次就判死循环」，表现为永远等满 3 秒后误报超时。
     __block _Atomic(BOOL) done = NO;
     dispatch_async(dispatch_get_main_queue(), ^{ atomic_store(&done, YES); });
-    uint64_t t0 = dcl_now_us();
+    uint64_t t0 = DCLNowUs();
     NSUInteger spins = 0;
     // 最多等 3 秒，避免测量本身把调用者挂死
     while (!atomic_load(&done) && spins < 3000) { usleep(1000); spins++; }
-    return atomic_load(&done) ? (double)(dcl_now_us() - t0) / 1000.0 : -1.0;
+    return atomic_load(&done) ? (double)(DCLNowUs() - t0) / 1000.0 : -1.0;
 }
 
 #pragma mark - 全线程快照

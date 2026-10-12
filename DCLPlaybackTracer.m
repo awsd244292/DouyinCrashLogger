@@ -5,6 +5,7 @@
 
 #import "DCLPlaybackTracer.h"
 #import "DCLWatchdog.h"
+#import "DCLSupport.h"   // DCLNowUs / DCLReplaceInstanceMethod —— 不再各模块自己抄一份
 
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -16,12 +17,6 @@
 #import <sys/time.h>
 
 #define DCL_BT_DEPTH 24
-
-static uint64_t dcl_now_us(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-}
 
 #pragma mark - 状态
 
@@ -216,7 +211,7 @@ static inline void dcl_capture(id player, NSString *action, float before, float 
     if (in_hook) return;
     in_hook = 1;
 
-    uint64_t now = dcl_now_us();
+    uint64_t now = DCLNowUs();
 
     // 抑制同一实例的高频重复（滑视频时抖音会连续调 pause）。
     // 必须排在 backtrace 之前：回溯是钩子体里唯一的重活，
@@ -286,38 +281,6 @@ static void dcl_sendEvent(id self, SEL _cmd, UIEvent *event) {
 
 #pragma mark - 挂载
 
-/// 本类是否「自己拥有」该方法的实现（不含从父类继承来的）。
-/// class_getInstanceMethod 会一路向上找到父类的实现，拿它去替换就会改到父类 ——
-/// 那是会波及所有子类的实质性破坏，必须先排除这种情况。
-static BOOL dcl_class_owns_method(Class cls, SEL sel) {
-    unsigned int count = 0;
-    Method *list = class_copyMethodList(cls, &count);
-    BOOL owned = NO;
-    if (list) {
-        for (unsigned int i = 0; i < count; i++) {
-            if (method_getName(list[i]) == sel) { owned = YES; break; }
-        }
-        free(list);
-    }
-    return owned;
-}
-
-static BOOL dcl_try_hook(Class cls, SEL sel, const char *typeEnc, void *newImp, void **outFn) {
-    if (!cls) return NO;
-    // 只替换本类自己的实现，绝不碰父类
-    if (!dcl_class_owns_method(cls, sel)) return NO;
-
-    IMP orig = class_replaceMethod(cls, sel, (IMP)newImp, typeEnc);
-    // orig 为 NULL 说明本类原本没有实现（此时已被强行添加），
-    // 后续钩子体将无处透传 —— 宁可不挂，也不能吞掉宿主行为。
-    if (!orig) return NO;
-    // 已挂过：再挂一次会让 orig 指向我们自己，形成自环
-    if (orig == (IMP)newImp) return NO;
-
-    *outFn = (void *)orig;
-    return YES;
-}
-
 @implementation DCLPlaybackTracer
 
 + (BOOL)isThirdPartyImageNamed:(NSString *)imageName {
@@ -342,17 +305,17 @@ static BOOL dcl_try_hook(Class cls, SEL sel, const char *typeEnc, void *newImp, 
         // AVFoundation 层：AVPlayer 是所有视频播放的汇聚点，继承自它的自研播放器自动被覆盖
         Class playerCls = NSClassFromString(@"AVPlayer");
         if (playerCls) {
-            if (dcl_try_hook(playerCls, @selector(pause), "v@:", (void *)dcl_pause, (void **)&dcl_orig_pause_fn)) g_hook_count++;
-            if (dcl_try_hook(playerCls, @selector(play), "v@:", (void *)dcl_play, (void **)&dcl_orig_play_fn)) g_hook_count++;
-            if (dcl_try_hook(playerCls, @selector(setRate:), "v@f", (void *)dcl_setRate, (void **)&dcl_orig_setRate_fn)) g_hook_count++;
-            if (dcl_try_hook(playerCls, @selector(replaceCurrentItemWithPlayerItem:),
+            if (DCLReplaceInstanceMethod(playerCls, @selector(pause), "v@:", (void *)dcl_pause, (void **)&dcl_orig_pause_fn)) g_hook_count++;
+            if (DCLReplaceInstanceMethod(playerCls, @selector(play), "v@:", (void *)dcl_play, (void **)&dcl_orig_play_fn)) g_hook_count++;
+            if (DCLReplaceInstanceMethod(playerCls, @selector(setRate:), "v@f", (void *)dcl_setRate, (void **)&dcl_orig_setRate_fn)) g_hook_count++;
+            if (DCLReplaceInstanceMethod(playerCls, @selector(replaceCurrentItemWithPlayerItem:),
                              "v@@", (void *)dcl_replaceItem, (void **)&dcl_orig_replaceItem_fn)) g_hook_count++;
         }
 
         // 触摸入口：唯一的额外动作就是打个时间戳
         Class uiAppCls = NSClassFromString(@"UIApplication");
         if (uiAppCls) {
-            if (dcl_try_hook(uiAppCls, @selector(sendEvent:), "v@@",
+            if (DCLReplaceInstanceMethod(uiAppCls, @selector(sendEvent:), "v@@",
                              (void *)dcl_sendEvent, (void **)&dcl_orig_sendEvent_fn)) {
                 g_hook_count++;
             }

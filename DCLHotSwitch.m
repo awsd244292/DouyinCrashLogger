@@ -4,145 +4,212 @@
 //
 //  热切换：三指轻点 → 翻转采集方案（safe ↔ full）→ 震 3 下反馈。
 //
-//  设计要点（呼应三轮审查的铁律）：
-//  1) 本监听独立于采集两档，始终安装 —— 否则 safe 档下用户点不出入口，
-//     就永远切不到 full 了。它属于「配置交互层」，不计入取证探针的 hook 集合。
-//  2) 绝不吞事件：钩子体第一步就是调用 orig 透传 touchesEnded，三指检测与
-//     翻转都发生在透传之后；即便检测逻辑异常也不会影响宿主触摸分发。
-//  3) 重入保护用线程局部变量（__thread），不挡其他线程的触摸回调。
-//  4) 只 hook UIView 本类自有的 touchesEnded:withEvent:，不碰父类；并正确取出
-//     且透传 orig，不破坏 UIView 自身的触摸分发链（UIApplication sendEvent: 的
-//     钩子由 DCLPlaybackTracer 在 full 档单独挂，互不干扰）。
-//  5) 翻转后由 DCLConfig 双写 NSUserDefaults + capture_mode.txt，重启后依然生效。
-//  6) 震动用公开 API（AudioServicesPlaySystemSound），一次只震一下；
-//     要「3 下」只能间隔重复调用（iOS 无公开的「震 N 下」接口）。
+//  【本次为什么重写】真机上一按三指毫无反应、也没震动。根因不在反馈，而在监听点：
+//  旧实现把钩子挂在 UIView「本类自有」的 touchesEnded:withEvent: 上，并要求本类
+//  必须自己实现该方法才算挂成功。可 UIKit 里 UIControl / UIWindow / 各类容器视图
+//  几乎都重写了 touchesEnded:withEvent:，宿主触摸最终落到的视图绝大多数是子类实例，
+//  走的是子类实现 —— 我们等于在一个没人经过的路口蹲了三个月。
+//
+//  正解：挂在事件唯一总入口 UIApplication sendEvent:（UIWindow 同名方法兜底），
+//  所有触摸、无论最终落到哪个视图，都必然先从这里过一遍。
+//
+//  设计要点（沿用三轮审查定下的铁律）：
+//  1) 独立于两档采集始终安装 —— 否则 safe 档下用户点不出入口，就永远切不到 full。
+//  2) 绝不吞事件：钩子体第一步就透传，检测与翻转都在透传之后。
+//  3) 与 DCLPlaybackTracer 的 sendEvent: 钩子共存：双方都取原实现做链式透传，
+//     先装的后装各自只包一层，不会互相覆盖也不会形成自环（见 DCLReplaceInstanceMethod 守卫）。
+//  4) 手势判定用事件流水做状态机，不要求三指「同一帧」同时抬起 —— 真手指做不到那么齐。
+//  5) 每次翻转都往 runtime 日志留痕：即便设备关了震动，「有没有生效」也一眼可查。
 //
 
 #import "DCLHotSwitch.h"
 #import "DCLConfig.h"
+#import "DCLSupport.h"
+#import "DCLLogger.h"
 
-#import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
-#import <objc/runtime.h>
+#import <UIKit/UIKit.h>
 #import <stdatomic.h>
-#import <sys/time.h>
 
-static uint64_t dcl_hs_now_us(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-}
-
-/// 本类是否「自己拥有」该方法的实现（不含从父类继承来的）。
-/// class_getInstanceMethod 会一路向上找到父类实现，拿它去替换会改到父类，
-/// 必须先用本函数排除这种情况。
-static BOOL dcl_hs_class_owns_method(Class cls, SEL sel) {
-    unsigned int count = 0;
-    Method *list = class_copyMethodList(cls, &count);
-    BOOL owned = NO;
-    if (list) {
-        for (unsigned int i = 0; i < count; i++) {
-            if (method_getName(list[i]) == sel) { owned = YES; break; }
-        }
-        free(list);
-    }
-    return owned;
-}
-
-/// 取原方法 encoding 后替换，避免手写 type encoding 出错。
-/// 出参用 void ** 而非 IMP *：clang 下 IMP 是 void(*)(void)，与本项目的
-/// void(*)(id,SEL,id,id) 函数指针不兼容且 -Werror 会报错，故沿用
-/// DCLPlaybackTracer 的 (void **) 强转写法绕过类型检查。
-static BOOL dcl_hs_try_hook(Class cls, SEL sel, IMP newImp, void **outOrig) {
-    if (!cls) return NO;
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
-    if (!dcl_hs_class_owns_method(cls, sel)) return NO;  // 只换本类自有实现，不碰父类
-    const char *enc = method_getTypeEncoding(m);
-    if (!enc) return NO;
-    IMP orig = class_replaceMethod(cls, sel, newImp, enc);
-    if (!orig) return NO;            // 本类无实现，无处透传，宁可不挂
-    if (orig == newImp) return NO;   // 再挂会形成自环
-    *outOrig = (void *)orig;
-    return YES;
-}
+/// 判定所需手指数
+static const NSUInteger DCL_HS_FINGERS = 3;
+/// 去抖：一次触发后这段时间内不再响应
+static const uint64_t DCL_HS_DEBOUNCE_US = 800000ULL;      // 800ms
+/// 手势最长时间：三指按住超过这么久再抬起，按拖拽处理，不判为轻点
+static const uint64_t DCL_HS_MAX_GESTURE_US = 1200000ULL;  // 1.2s
+/// 三下之间的间隔
+static const int64_t DCL_HS_BUZZ_GAP_MS = 180;
 
 #pragma mark - 状态
 
-static void (*dcl_hs_orig_touchesEnded)(id, SEL, id, id) = NULL;
+static void (*dcl_hs_orig_sendEvent)(id, SEL, id) = NULL;
 static volatile int32_t dcl_hs_installed = 0;
-static _Atomic(uint64_t) dcl_hs_last_trigger = 0;   // 去抖时间戳（us）
-static const uint64_t DCL_HS_DEBOUNCE_US = 600000ULL;  // 600ms 内只触发一次
+static volatile int32_t dcl_hs_install_succeeded = 0;
+static NSString *dcl_hs_install_target = @"(not installed)";
 
-#pragma mark - 震动
+/// 手势起始时间：三指同时按下的那一刻（0 = 当前无手势）
+static _Atomic(uint64_t) dcl_hs_gesture_start = 0;
+static _Atomic(uint64_t) dcl_hs_last_trigger = 0;
 
-static void dcl_hs_vibrate_times(int n) {
-    // 公开 API 只能震一下；要 N 下只能间隔重复调用。
-    for (int i = 0; i < n; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 180) * NSEC_PER_MSEC),
-                       dispatch_get_main_queue(), ^{
-            AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-        });
+#pragma mark - 反馈
+
+/// 三连震 / 三连触感。
+/// 优先用 UIImpactFeedbackGenerator：抖音这类 App 里它比 AudioServices 的那声
+/// 「老式蜂鸣」更可靠、辨识度也高；老设备取不到该类时退到 AudioServices。
+static void dcl_hs_feedback(void) {
+    dispatch_block_t buzzLegacy = ^{
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+    };
+    dispatch_block_t buzzHaptic = ^{
+        UIImpactFeedbackGenerator *gen = nil;
+        @try {
+            gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
+            [gen prepare];
+        } @catch (id e) {
+            gen = nil;
+        }
+        if (!gen) { buzzLegacy(); return; }
+        for (int i = 0; i < 3; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)i * DCL_HS_BUZZ_GAP_MS * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    if (i > 0) [gen prepare];
+                    [gen impactOccurred];
+                } @catch (id e) {
+                    buzzLegacy();
+                }
+            });
+        }
+    };
+
+    dispatch_async(dispatch_get_main_queue(), buzzHaptic);
+}
+
+#pragma mark - 手势判定
+
+/// 返回 YES 表示这次事件构成了「三指轻点抬起」的完整手势
+static BOOL dcl_hs_check_gesture(UIEvent *event, uint64_t *outNow) {
+    if ([event type] != UIEventTypeTouches) return NO;
+
+    NSSet<UITouch *> *all = [event allTouches];
+    if (all.count == 0) return NO;
+
+    NSUInteger active = 0, ended = 0;
+    for (UITouch *t in all) {
+        UITouchPhase ph = [t phase];
+        if (ph == UITouchPhaseEnded || ph == UITouchPhaseCancelled) ended++;
+        else if (ph == UITouchPhaseBegan || ph == UITouchPhaseMoved ||
+                 ph == UITouchPhaseStationary) active++;
     }
+
+    uint64_t now = DCLNowUs();
+    *outNow = now;
+
+    // 阶段一：三指都在屏上（active>0 且总指头数达到 3）→ 记录手势起点。
+    // 刻意只在起点为空时写：按住迟迟不抬视为拖拽，届时超时自动作废。
+    if (active > 0 && all.count >= DCL_HS_FINGERS) {
+        uint64_t expected = 0;
+        atomic_compare_exchange_strong(&dcl_hs_gesture_start, &expected, now);
+        return NO;
+    }
+
+    // 阶段二：所有指头都已抬起 → 若此前确实有过三指，且时长在轻点范围内，判定成立
+    if (ended > 0 && active == 0) {
+        uint64_t start = atomic_exchange(&dcl_hs_gesture_start, 0);
+        return (start != 0) && (now - start) <= DCL_HS_MAX_GESTURE_US;
+    }
+
+    // 其余情形（既未按也未抬起）：保险起见清掉起点，避免陈旧状态污染下一轮判定
+    if (active == 0 && ended == 0) atomic_store(&dcl_hs_gesture_start, 0);
+    return NO;
 }
 
 #pragma mark - 钩子体（原样透传，零吞事件）
 
-static void dcl_hs_touchesEnded(id self, SEL _cmd, NSSet *touches, UIEvent *event) {
+static void dcl_hs_sendEvent(id self, SEL _cmd, UIEvent *event) {
     static __thread int in_hook = 0;
-    // 重入保护：必须先透传再 return，绝不能只 return 把控制交回出错处
     if (in_hook) {
-        if (dcl_hs_orig_touchesEnded) dcl_hs_orig_touchesEnded(self, _cmd, touches, event);
+        if (dcl_hs_orig_sendEvent) dcl_hs_orig_sendEvent(self, _cmd, event);
         return;
     }
     in_hook = 1;
 
     // 铁律：先透传，绝不吞事件
-    if (dcl_hs_orig_touchesEnded) dcl_hs_orig_touchesEnded(self, _cmd, touches, event);
+    if (dcl_hs_orig_sendEvent) dcl_hs_orig_sendEvent(self, _cmd, event);
 
     @try {
-        // 三指同时抬起即判定为切换手势（抖音主要用单指上下滑切视频，
-        // 三指手势在日常交互中几乎不会误触；即便偶发误触也只翻转档位 + 震一下，无破坏性）。
-        NSSet<UITouch *> *all = [event allTouches];
-        if (all.count == 3) {
-            BOOL allEnded = YES;
-            for (UITouch *t in all) {
-                if (t.phase != UITouchPhaseEnded && t.phase != UITouchPhaseCancelled) {
-                    allEnded = NO;
-                    break;
-                }
-            }
-            if (allEnded) {
-                uint64_t now = dcl_hs_now_us();
-                uint64_t last = atomic_load(&dcl_hs_last_trigger);
-                if (now - last > DCL_HS_DEBOUNCE_US) {
-                    atomic_store(&dcl_hs_last_trigger, now);
-                    [DCLConfig toggleProfile];
-                    dcl_hs_vibrate_times(3);
-                }
+        uint64_t now = 0;
+        if (dcl_hs_check_gesture(event, &now)) {
+            uint64_t last = atomic_load(&dcl_hs_last_trigger);
+            if (now - last > DCL_HS_DEBOUNCE_US) {
+                atomic_store(&dcl_hs_last_trigger, now);
+                DCLCaptureProfile before = [DCLConfig captureProfile];
+                [DCLConfig toggleProfile];
+                DCLCaptureProfile after = [DCLConfig captureProfile];
+                dcl_hs_feedback();
+
+                // 留痕：无弹窗、无 UI，这是唯一能确认「确实翻过了」的出口
+                [DCLLogger appendRuntimeLine:
+                 [NSString stringWithFormat:@"[DCL] hotswitch: three-finger tap -> %@ -> %@ (hooks %@)",
+                  (before == DCLCaptureProfileFull ? @"full" : @"safe"),
+                  (after == DCLCaptureProfileFull ? @"full" : @"safe"),
+                  (after == DCLCaptureProfileFull ? @"ON" : @"OFF")]];
             }
         }
     } @catch (id e) {
         (void)e;
+    } @finally {
+        in_hook = 0;
     }
-
-    in_hook = 0;
 }
+
+#pragma mark - 挂载
 
 @implementation DCLHotSwitch
 
 + (BOOL)isInstalled {
-    return dcl_hs_installed != 0;
+    return dcl_hs_installed != 0 && dcl_hs_install_succeeded != 0;
+}
+
++ (NSString *)installStateDescription {
+    if (dcl_hs_installed == 0) return @"未安装（尚未到延迟安装时机）";
+    if (dcl_hs_install_succeeded == 0) return @"安装失败：宿主未提供可钩的事件入口";
+    return [NSString stringWithFormat:@"已安装：%@ sendEvent: 旁路监听（三指轻点翻转 safe/full）",
+            dcl_hs_install_target];
 }
 
 + (void)install {
     if (__sync_fetch_and_or(&dcl_hs_installed, 1)) return;
     @try {
-        Class viewCls = NSClassFromString(@"UIView");
-        if (viewCls) {
-            dcl_hs_try_hook(viewCls, @selector(touchesEnded:withEvent:),
-                            (IMP)dcl_hs_touchesEnded, (void **)&dcl_hs_orig_touchesEnded);
+        // 第一选择：UIApplication sendEvent: —— 所有触摸事件的唯一总入口。
+        // 只有它才能让检测「挂得满」：钩子落在 UIView 上会被无数子类重写挡掉，这是上一版失效的真因。
+        Class appCls = NSClassFromString(@"UIApplication");
+        if (appCls) {
+            if (DCLReplaceInstanceMethod(appCls, @selector(sendEvent:), "v@@",
+                                         (void *)dcl_hs_sendEvent,
+                                         (void **)&dcl_hs_orig_sendEvent)) {
+                dcl_hs_install_target = @"UIApplication";
+                dcl_hs_install_succeeded = 1;
+                [DCLLogger appendRuntimeLine:@"[DCL] hotswitch: installed on UIApplication sendEvent:"];
+                return;
+            }
         }
+        // 兜底：宿主若给 UIApplication 换了自定义实现收不到（极罕见），退到 UIWindow
+        Class winCls = NSClassFromString(@"UIWindow");
+        if (winCls) {
+            if (DCLReplaceInstanceMethod(winCls, @selector(sendEvent:), "v@@",
+                                         (void *)dcl_hs_sendEvent,
+                                         (void **)&dcl_hs_orig_sendEvent)) {
+                dcl_hs_install_target = @"UIWindow";
+                dcl_hs_install_succeeded = 1;
+                [DCLLogger appendRuntimeLine:@"[DCL] hotswitch: installed on UIWindow sendEvent:"];
+                return;
+            }
+        }
+        // 两条路都没挂上：如实记录，健康自检里会显示「安装失败」，不静默假成功
+        NSString *why = @"[DCL] hotswitch: INSTALL FAILED (no usable sendEvent: owner)";
+        fprintf(stderr, "%s\n", [why UTF8String]);
+        [DCLLogger appendRuntimeLine:why];
     } @catch (id e) {
         (void)e;
     }

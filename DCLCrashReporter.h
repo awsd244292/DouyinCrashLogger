@@ -83,6 +83,10 @@ typedef NS_ENUM(NSInteger, DCLPreviousExitKind) {
 /// 上次退出性质的中文说明（可直接写进日志）
 + (NSString *)previousExitDescription;
 
+/// 上一句的同义英文版，专供 plugin_runtime.log —— 那份文件会被各种查看工具打开，
+/// 编码不可控，写中文出来就是一屏乱码。
++ (NSString *)previousExitDescriptionASCIILine;
+
 /// 是否首次运行（无历史退出标记）
 + (BOOL)firstLaunchEver;
 

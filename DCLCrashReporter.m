@@ -6,8 +6,10 @@
 //
 
 #import "DCLCrashReporter.h"
-#import "DCLConstants.h"
 #import "DCLConfig.h"
+#import "DCLConstants.h"
+#import "DCLLogger.h"
+#import "DCLSupport.h"
 #import "DCLWatchdog.h"
 #import "DCLPlaybackTracer.h"
 #import "DCLHealthCheck.h"
@@ -494,26 +496,15 @@ static void dcl_prepare_meta(void) {
 
 + (void)cleanupOldLogs {
     @autoreleasepool {
+        // 清理的三道闸门（份数 / 超龄 / 目录总量）统一交给日志管家，此处不重复实现。
         NSString *dir = [self crashLogsDirectory];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
+        @try { [DCLLogger cleanupLogs]; } @catch (id e) { (void)e; }
 
-        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
-        NSMutableArray<NSDictionary *> *items = [NSMutableArray array];
-        for (NSString *f in files) {
-            if (![f hasPrefix:@"crash_"]) continue;
-            NSString *p = [dir stringByAppendingPathComponent:f];
-            NSDictionary *attrs = [fm attributesOfItemAtPath:p error:nil];
-            [items addObject:@{@"path": p,
-                              @"date": attrs[NSFileModificationDate] ?: [NSDate distantPast]}];
-        }
-        [items sortUsingDescriptors:@[[NSSortDescriptor sortDescriptorWithKey:@"date"
-                                                                  ascending:NO]]];
-        for (NSUInteger i = DCLMaxRetainedLogs; i < items.count; i++) {
-            [fm removeItemAtPath:items[i][@"path"] error:nil];
-        }
-
-        // 同步 C 缓冲区供信号处理路径使用
+        // 与崩溃路径生死攸关的一件事留在本地：同步 C 缓冲区供信号处理路径使用
         strncpy(g_logDir, [dir UTF8String] ?: "", sizeof(g_logDir) - 1);
         g_logDir[sizeof(g_logDir) - 1] = '\0';
     }
@@ -652,32 +643,28 @@ static void dcl_prepare_meta(void) {
     }
 }
 
-/// 把上次退出性质的结论追加到 plugin_runtime.log（极简版无 UI，这是唯一的可见出口）
+/// 把上次退出性质的结论追加到 plugin_runtime.log（极简版无 UI，这是唯一的可见出口）。
+///
+/// 关键改动：这里一律走 DCLLogger + 英文。原因很朴素 —— runtime log 里一半内容是
+/// 宿主吐出来的，编码混乱；再混进去 UTF-8 中文，第三方工具一打开就是满屏
+/// 「ä¸­æ–‡」式的乱码。DCLLogger 会把任何非 ASCII 字节转成 \xNN，
+/// 与其让它把所有中文都转义成一串不可读的东西，不如给出英文原文。
 + (void)dcl_appendPreviousExitVerdictToRuntimeLog {
     @try {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:[self crashLogsDirectory]
-      withIntermediateDirectories:YES
-                       attributes:nil
-                            error:nil];
-        FILE *f = fopen([[self runtimeLogPath] UTF8String], "a");
-        if (!f) return;
-
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        fprintf(f, "----- [DCL] launch @ %lld.%06lld -----\n",
-                (long long)tv.tv_sec, (long long)tv.tv_usec);
-        fprintf(f, "[DCL] 上次退出性质：%s\n", [[self previousExitDescription] UTF8String]);
+        [DCLLogger appendRuntimeLine:@"----- [DCL] launch -----"];
+        [DCLLogger appendRuntimeLine:
+         [NSString stringWithFormat:@"[DCL] previous exit: %@", [self previousExitDescriptionASCIILine]]];
 
         if (g_last_normal_exit_date) {
-            fprintf(f, "[DCL] 上次正常退出时间：%s\n",
-                    [[g_last_normal_exit_date description] UTF8String]);
+            [DCLLogger appendRuntimeLine:
+             [NSString stringWithFormat:@"[DCL] last normal exit: %@",
+              [g_last_normal_exit_date description]]];
         }
         if (!g_first_launch && g_prev_enter_bg_time > 0 && g_prev_was_backgrounded) {
-            NSTimeInterval stay = g_prev_launch_time > 0 ? (tv.tv_sec - g_prev_enter_bg_time) : 0;
-            fprintf(f, "[DCL] 上次后台停留约 %.0f 秒后进程结束\n", stay);
+            NSTimeInterval stay = ([[NSDate date] timeIntervalSince1970] - g_prev_enter_bg_time);
+            [DCLLogger appendRuntimeLine:
+             [NSString stringWithFormat:@"[DCL] process ended after ~%.0fs in background", stay]];
         }
-        fclose(f);
     } @catch (id e) {
         (void)e;
     }
@@ -739,6 +726,27 @@ static void dcl_prepare_meta(void) {
     return @"(未知)";
 }
 
+/// 同上，但是英文版 —— 专供 plugin_runtime.log 使用。
+/// 那份文件会被各种日志查看工具打开，编码不可控；英文是最稳的唯一选择。
+/// 面向人读的结构化报告（latest.log）仍用 previousExitDescription 的中文版本。
++ (NSString *)previousExitDescriptionASCIILine {
+    switch (g_prev_exit_kind) {
+        case DCLPreviousExitKindFirstLaunch:
+            return @"first launch (no history)";
+        case DCLPreviousExitKindNormal:
+            return @"normal exit";
+        case DCLPreviousExitKindBackgroundKilled:
+            return @"killed while in background (user swipe-up or system reclaim; not a crash)";
+        case DCLPreviousExitKindBackgroundCrashed:
+            return @"crashed while in background (report written)";
+        case DCLPreviousExitKindForegroundCrashed:
+            return @"crashed in foreground (report written)";
+        case DCLPreviousExitKindSuspicious:
+            return @"suspicious foreground termination, no report (OOM / watchdog / very early crash)";
+    }
+    return @"(unknown)";
+}
+
 + (BOOL)lastExitWasAbnormal {
     // 语义收窄：只有「前台崩溃」或「前台异常终止且抓不到原因」才算异常。
     // 后台被终止（用户主动划掉 / 系统回收）一律不算 —— 这正是本次误判的来源。
@@ -761,27 +769,14 @@ static void dcl_prepare_meta(void) {
 
 + (void)redirectStderrToRuntimeLog {
     @try {
-        NSString *dir = [self crashLogsDirectory];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                   withIntermediateDirectories:YES
-                                                    attributes:nil
-                                                         error:nil];
-        NSString *path = [self runtimeLogPath];
-
-        // 把 stderr / stdout 重定向到沙盒 runtime 日志。即便随后被 SIGKILL，
-        // 被杀前已经落盘的部分仍可作为排查线索（末尾可能丢失）。
-        // 注意：freopen 必须在“延迟块”里执行，绝不能放在 constructor / +load 阶段，
-        // 否则可能影响注入早期稳定性。
-        FILE *fe = freopen([path UTF8String], "a+", stderr);
-        (void)fe;
-        FILE *fo = freopen([path UTF8String], "a+", stdout);
-        (void)fo;
+        // 不再 freopen 直写：改由日志管家接管 stderr/stdout（管道 + 后台泵），
+        // 从而有机会在落盘前过滤系统刷屏、折叠重复行、净化非 ASCII，并守住大小闸门。
+        // 三条安全约束见 DCLLogger.h —— 尤其是「写端 O_NONBLOCK」这条，
+        // 它保证泵线程出事时也绝不会反过来把宿主卡住。
+        [DCLLogger installStderrCapture];
 
         // 立即落一行启动标记，便于区分每次运行
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        fprintf(stderr, "\n--- [DCL] runtime log attached @ %lld.%06lld ---\n",
-                (long long)tv.tv_sec, (long long)tv.tv_usec);
+        fprintf(stderr, "\n--- [DCL] runtime log attached ---\n");
         fflush(stderr);
     } @catch (id e) {
         (void)e;

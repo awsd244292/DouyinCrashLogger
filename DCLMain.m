@@ -14,16 +14,21 @@
 //  日志位置（App 沙盒内，直接用 Filza / 自签工具导出容器即可读取）：
 //    Documents/DouyinCrashLogs/
 //      ├── crash_<时间戳>_P<pid>.log   崩溃报告（信号 + OC 异常 + 回溯 + 镜像基址表）
-//      ├── plugin_runtime.log          stderr/stdout 重定向 + 每次启动的退出状态标记
+//      ├── plugin_runtime.log          本次会话的运行日志（每轮冷启动轮转一次，大小有闸门）
+//      ├── plugin_runtime_prev.log     上一会话的运行日志（只留一份）
 //      └── latest.log                  最新状态快照（播放诊断 + 健康自检 + 上次退出性质）
 //
+//  为什么 runtime 日志要按会话拆开：以前所有会话都往同一个文件里追加，
+//  以前所有会话都往同一个 plugin_runtime.log 里追加，宿主再在里面刷屏，
+//  文件动辄几 MB 且从不清顶部，真正有用的那几行早被冲没了。现在当前会话永远从干净的一页开始写。
+//
 //  时序（防闪退）：
-//   1) constructor 早期：安装信号/OC 异常捕获、清理旧日志、写入上次退出状态标记。
+//   1) constructor 早期：日志轮转与清理、安装信号/OC 异常捕获、写入上次退出状态标记。
 //      —— 捕获必须尽早，否则启动早期的崩溃抓不到。
 //   2) 延迟 2s 主线程：按当前采集方案安装看门狗（两档都装）与播放探针（仅 full 档），
-//      再做 freopen 重定向 stderr/stdout，并自动写一份 latest.log。
+//      再做 stderr/stdout 重定向，并自动写一份 latest.log。
 //      —— 这两类 install 在头文件中明确标注「绝不在 constructor 阶段」，故延迟到此；
-//         freopen 同样绝不能放在 constructor / +load 阶段，否则影响注入早期稳定性。
+//         重定向同理，绝不能放在 constructor / +load 阶段，否则影响注入早期稳定性。
 //
 
 #import <UIKit/UIKit.h>
@@ -33,25 +38,30 @@
 #import "DCLPlaybackTracer.h"
 #import "DCLConfig.h"
 #import "DCLHotSwitch.h"
+#import "DCLLogger.h"
 
 __attribute__((constructor)) static void dcl_entry(void) {
     @try {
-        // 1) 崩溃捕获尽早安装（不可延迟）
+        // 1) 先把日志文件整理好：当前会话单独一份、上一会话留一份、按份数/超龄/总量清
+        //    —— 必须在任何日志写入之前做，否则本轮的内容会被当成旧账轮转走。
+        [DCLLogger rotateRuntimeLogAtLaunch];
+
+        // 2) 崩溃捕获尽早安装（不可延迟）
         [DCLCrashReporter install];
         [DCLCrashReporter cleanupOldLogs];
 
-        // 2) 退出状态标记：把「上次是否疑似闪退」追加写入 plugin_runtime.log，
+        // 3) 退出状态标记：把「上次是否疑似闪退」追加写入本轮 runtime 日志，
         //    这样即使没有 App 内页面，直接读容器里的文件也能判断；
         //    同时注册 WillTerminate 观察者，供下一轮判定。
         [DCLCrashReporter recordExitMarkAndRegisterTerminateObserver];
 
-        // 3) 注册「生成最新日志 latest.log」的触发器（截图 / 进入后台）
+        // 4) 注册「生成最新日志 latest.log」的触发器（截图 / 进入后台）
         [DCLCrashReporter registerSnapshotTriggers];
     } @catch (id e) {
         (void)e;
     }
 
-    // 4) 以下「重活」全部延迟到主 runloop 稳定后，且放到主线程（dispatch 到 main queue）：
+    // 5) 以下「重活」全部延迟到主 runloop 稳定后，且放到主线程（dispatch 到 main queue）：
     //    - Watchdog 安装（需在主线程挂 CFRunLoopObserver + 起后台线程）；
     //    - 播放暂停探针安装（方法交换 AVPlayer / UIApplication，需类已加载且主线程）；
     //    - stderr/stdout 重定向；

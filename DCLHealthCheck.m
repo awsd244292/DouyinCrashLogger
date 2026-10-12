@@ -8,6 +8,8 @@
 #import "DCLConfig.h"
 #import "DCLWatchdog.h"
 #import "DCLPlaybackTracer.h"
+#import "DCLHotSwitch.h"
+#import "DCLLogger.h"
 
 #import <dlfcn.h>
 #import <mach/mach.h>
@@ -306,6 +308,57 @@
 
 #pragma mark - 入口
 
+/// 9) 日志管线：stderr 是否接管成功 + 当前会话日志体量是否被闸门管住。
+///    反馈里「文件又大又从不清」就是这一项要盯的事。
++ (DCLHealthItem *)checkLogPipeline {
+    DCLHealthItem *it = [DCLHealthItem new];
+    it.name = @"日志管线（会话轮转 + 大小闸门）";
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *cur = [DCLLogger runtimeLogPath];
+        unsigned long long curSize = [[fm attributesOfItemAtPath:cur error:nil] fileSize];
+        BOOL prev = [fm fileExistsAtPath:[DCLLogger previousRuntimeLogPath]];
+        const NSUInteger capBytes = [DCLLogger runtimeLogMaxBytes];
+
+        if ([DCLLogger stderrCaptureInstalled] && curSize <= capBytes) {
+            it.level = DCLHealthLevelPass;
+            it.evidence = [NSString stringWithFormat:
+                           @"stderr/stdout 已接管（管道+后台泵，写端 O_NONBLOCK）；"
+                           @"当前会话日志 %llu B / 上限 %lu B，上一会话%s",
+                           curSize, (unsigned long)capBytes, prev ? "已轮转为 _prev" : "（首轮无）"];
+        } else if (![DCLLogger stderrCaptureInstalled]) {
+            it.level = DCLHealthLevelWarn;
+            it.evidence = @"stderr/stdout 未接管（宿主已在重定向或本次注入方式受限）；"
+                          @"本插件自身的日志仍会写盘，但看不到宿主的 stdout 输出";
+        } else {
+            it.level = DCLHealthLevelWarn;
+            it.evidence = [NSString stringWithFormat:
+                           @"当前会话日志 %llu B，已超过上限 %lu B 却未被裁剪 —— 需复查闸门逻辑",
+                           curSize, (unsigned long)capBytes];
+        }
+    } @catch (id e) {
+        it.level = DCLHealthLevelWarn;
+        it.evidence = @"检查异常，无法确认日志管线状态";
+    }
+    return it;
+}
+
+/// 10) 三指热切换监听是否挂上。三指没反应时，这一项是第一现场：
+///     先看「监听有没有挂上」，再谈「有没有震动」。
++ (DCLHealthItem *)checkHotSwitch {
+    DCLHealthItem *it = [DCLHealthItem new];
+    it.name = @"三指热切换监听";
+    @try {
+        BOOL ok = [DCLHotSwitch isInstalled];
+        it.level = ok ? DCLHealthLevelPass : DCLHealthLevelWarn;
+        it.evidence = [DCLHotSwitch installStateDescription];
+    } @catch (id e) {
+        it.level = DCLHealthLevelWarn;
+        it.evidence = @"检查异常，无法确认监听状态";
+    }
+    return it;
+}
+
 + (NSArray<DCLHealthItem *> *)run {
     NSMutableArray *items = [NSMutableArray array];
     @try {
@@ -317,6 +370,8 @@
         [items addObject:[self checkPlaybackProbe]];
         [items addObject:[self checkInjectedModules]];
         [items addObject:[self checkResourceFootprint]];
+        [items addObject:[self checkLogPipeline]];
+        [items addObject:[self checkHotSwitch]];
         // 主线程响应实测放最后：它会阻塞调用方最多 3 秒，别挡住前面各项
         [items addObject:[self checkMainThreadResponsive]];
     } @catch (id e) {
