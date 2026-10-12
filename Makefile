@@ -81,7 +81,7 @@ $(FAT): $(OBJS)
 	  -Wl,-platform_version,ios,$(MIN_IOS),$(MIN_IOS) -Wl,-arch,arm64 \
 	  -install_name @rpath/$(TWEAK).dylib \
 	  -o $@ $^
-	@echo "==> $@ ($(shell file $@ | cut -d: -f2-))"
+	@printf '==> %s\n' "$@"
 
 dylib: $(FAT)
 	@$(MAKE) -s verify
