@@ -1,97 +1,54 @@
-# DouyinCrashLogger — 纯 clang 交叉编译（无需 Theos / 无需 macOS）
+# DouyinCrashLogger — 不用 macOS 编译 iOS dylib（纯 clang + ld64.lld）
 #
-# 思路（对齐 PerfDebugPlugin 的本地真机级构建）：
-#   - clang 18 直接交叉编译到 arm64-apple-ios
-#   - ld64.lld 负责 Mach-O 链接（-undefined dynamic_lookup 兜底，不依赖任何注入框架）
-#   - 本地秒级编译、CI 也省掉装 Theos 的步骤，整体更快更轻
+# 原理详见文档《28-非macOS编译iOS-dylib方案》：
+#   编译器 clang（上游 LLVM）不挑宿主，只认 -target 三元组；
+#   链接器换 LLVM 的 ld64.lld，输出标准 Mach-O；
+#   SDK 是纯文件，稀疏拉取一次到 ~/.pdp-sdks 即可离线复用。
 #
-# 关于架构：当前链接器 ld64.lld（LLVM 的 Mach-O 后端）对 arm64e / 指针认证(PAC)
-# 支持不全，arm64e 目标会被静默降级成 arm64，故只产出 **arm64 单切片**。
-# 注入到 arm64e 宿主 App 完全没问题（dyld 支持混合加载），功能不受影响。
-# 等将来有支持 PAC 的链接器时，把下面 ARCHS 改回 "arm64 arm64e" 即可恢复双切片。
+# 入口：
+#   make dylib       交叉编译 -> build/DouyinCrashLogger.dylib（arm64）
+#   make syntax      纯语法预检（自带桩头文件，不需要 SDK，秒级冒烟）
+#   make verify      对已有 dylib 跑纯 Python Mach-O 结构自检
+#   make deb         打包 .deb（越狱用；巨魔/自签注入只用 dylib）
+#   make fetch-sdk   仅拉取 SDK
+#   make clean
 #
-# 首次： make fetch-sdk   （一次性稀疏拉取 iPhoneOS SDK，约 220MB，放 ~/.pdp-sdks）
-# 日常： make dylib        （产出 build/DouyinCrashLogger.dylib，arm64）
-#        make deb          （打包 .deb，供越狱；巨魔/自签注入只用 dylib）
-#        make precheck     （静态自检，无需 SDK）
-#        make verify       （对已有 dylib 跑交付前静态自检）
-#        make clean
+# 可调环境变量：
+#   MIN_IOS=15.0 make dylib               最低 iOS 版本（默认 14.0）
+#   SDK_VERSION=iPhoneOS14.5.sdk make dylib
+#   SDK_SYSROOT=/path/to/sdk make dylib   用手头已有 SDK
+#   OUT=dist/xx.dylib make dylib          自定义输出
+#   CC=clang-17 LD=/usr/lib/llvm-17/bin/ld64.lld make dylib
+#
+# 注意：本方案不支持 arm64e（LLVM ld64.lld 无 Apple 私有 ptrauth ABI，
+# 硬编出来的 cpusubtype 是 0x0，与 arm64 逐字节相同，属假货）。
+# 注入场景用 arm64 即可；需要 arm64e 请走 macOS + Theos。
 
-# ---- 工具链（clang 18 + llvm-lld 的 Mach-O 链接器 ld64.lld）--------------
-CLANG      ?= clang
-LLVM_BIN   := $(dir $(realpath $(shell which clang)))
-LD64_LLD   := $(LLVM_BIN)ld64.lld
+TWEAK      := DouyinCrashLogger
+VERSION    := $(shell grep -E '^Version:' control | head -1 | cut -d' ' -f2)
+PKG_VER    := $(subst .,_,$(VERSION))
+BUILD      := build
+FAT        := $(BUILD)/$(TWEAK).dylib
 DPKG_DEB   ?= dpkg-deb
 
-# ---- SDK ----------------------------------------------------------------
-# SDK 只在真正编译/打包时需要；precheck / fetch-sdk / clean 不需要，
-# 不要把 SDK 缺失的报错挡在所有目标前面。
-SDKROOT ?= $(HOME)/.pdp-sdks/iPhoneOS14.5.sdk
-NEED_SDK :=
-ifneq ($(filter dylib deb,$(MAKECMDGOALS)),)
-NEED_SDK := 1
-endif
-ifeq ($(MAKECMDGOALS),)
-NEED_SDK := 1
-endif
-ifeq ($(NEED_SDK),1)
-ifeq ($(wildcard $(SDKROOT)),)
-$(error SDK 不存在：$(SDKROOT)；请先执行 `make fetch-sdk` 拉取 iPhoneOS SDK)
-endif
-endif
-
-# ---- 目标参数 ------------------------------------------------------------
-MIN_IOS   := 14.0
-ARCHS     := arm64
-TWEAK     := DouyinCrashLogger
-VERSION   := $(shell grep -E '^Version:' control | head -1 | cut -d' ' -f2)
-PKG_VER   := $(subst .,_,$(VERSION))
-
-# ---- 源文件 --------------------------------------------------------------
-FILES := DCLMain.m DCLConstants.m DCLCrashReporter.m DCLWatchdog.m DCLPlaybackTracer.m \
-         DCLHealthCheck.m DCLConfig.m DCLHotSwitch.m DCLLogger.m DCLSupport.m
-
-CFLAGS := -fobjc-arc -O0 -Wno-deprecated-declarations
-SYSROOT_FLAGS := -isysroot $(SDKROOT)
-FRAMEWORK_DIRS := $(SDKROOT)/System/Library/Frameworks $(SDKROOT)/System/Library/PrivateFrameworks
-FW_FLAGS := $(foreach d,$(FRAMEWORK_DIRS),-F$(d))
-
-# ---- 产物路径 ------------------------------------------------------------
-BUILD := build
-OBJ   := $(BUILD)/obj
-OBJS  := $(addprefix $(OBJ)/arm64/,$(FILES:.m=.o))
-FAT   := $(BUILD)/$(TWEAK).dylib
-
-.PHONY: all dylib deb precheck fetch-sdk clean verify
+.PHONY: all dylib syntax verify deb precheck fetch-sdk clean
 
 all: dylib
 
-# 编译（每个源文件一个 .o）
-$(OBJ)/arm64/%.o: %.m
-	@mkdir -p $(dir $@)
-	$(CLANG) -target arm64-apple-ios$(MIN_IOS) $(SYSROOT_FLAGS) $(FW_FLAGS) $(CFLAGS) -c $< -o $@
+# ---- 主线：不用 macOS 的交叉编译 ----
+dylib:
+	@bash tools/build_dylib.sh
 
-# 链接动态库：
-#   -nostdlib            不默认链 libSystem（配合 -undefined dynamic_lookup，全部符号运行时解析）
-#   -undefined dynamic_lookup  任何未定义符号都留给 dyld 在加载时解析，不依赖 substrate/UIKit 等宿主框架
-#   -Wl,-platform_version / -Wl,-arch  显式补齐 ld64.lld 在自定义 -fuse-ld 下不自动下发的 Darwin 参数
-$(FAT): $(OBJS)
-	$(CLANG) -target arm64-apple-ios$(MIN_IOS) -isysroot $(SDKROOT) \
-	  -fuse-ld=$(LD64_LLD) -dynamiclib -nostdlib -undefined dynamic_lookup \
-	  -Wl,-platform_version,ios,$(MIN_IOS),$(MIN_IOS) -Wl,-arch,arm64 \
-	  -install_name @rpath/$(TWEAK).dylib \
-	  -o $@ $^
-	@printf '==> %s\n' "$@"
+# ---- 语法预检（无 SDK 也能跑）----
+syntax:
+	@bash tools/syntaxcheck.sh
 
-dylib: $(FAT)
-	@$(MAKE) -s verify
-
-# 交付前静态自检（符号 / 架构 / 依赖白名单）；对已有 dylib 跑，不依赖 SDK
+# ---- 结构自检（纯 Python，不需要 Apple 工具）----
 verify:
-	@DYLIB=$(FAT); [ -f "$$DYLIB" ] || { echo "未找到 $FAT，请先 make dylib"; exit 1; }; \
-	 bash scripts/verify-dylib.sh $$DYLIB
+	@test -f "$(FAT)" || { echo "未找到 $(FAT)，请先 make dylib"; exit 1; }
+	@python3 tools/verify_dylib.py "$(FAT)" --install-name "@rpath/$(TWEAK).dylib"
 
-# 打包 .deb（越狱用；巨魔/自签注入只用上面的 dylib）
+# ---- 打包 .deb（越狱用）----
 deb: dylib
 	@rm -rf $(BUILD)/pkg
 	@mkdir -p $(BUILD)/pkg/DEBIAN
@@ -102,14 +59,14 @@ deb: dylib
 	@$(DPKG_DEB) --build -Zgzip $(BUILD)/pkg $(BUILD)/$(TWEAK)_$(PKG_VER).deb >/dev/null
 	@echo "==> $(BUILD)/$(TWEAK)_$(PKG_VER).deb"
 
-# 构建前静态自检（无需 SDK）
+# ---- 构建前静态自检（项目自有门禁，无需 SDK）----
 precheck:
 	@python3 scripts/scan_self_in_cfunc.py
 	@python3 scripts/test_capture_mode_parse.py
 	@bash -n scripts/verify-dylib.sh && echo "[3/3] verify-dylib.sh 语法 OK"
 
 fetch-sdk:
-	@bash scripts/fetch-sdk.sh
+	@bash scripts/fetch-sdk.sh "$(SDK_VERSION)"
 
 clean:
 	rm -rf $(BUILD)

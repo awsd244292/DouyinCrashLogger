@@ -73,20 +73,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install toolchain (clang + llvm-lld + llvm-lipo)
+      - name: Install toolchain (clang + llvm-lld)
         run: |
           sudo apt-get update -y
           sudo apt-get install -y clang lld llvm
           clang --version
-          ls "$(dirname "$(readlink -f "$(which clang)")")" | grep -E 'ld64.lld|llvm-lipo'
-
-      - name: Fetch iPhoneOS SDK (one-time, ~220MB)
-        run: make fetch-sdk
+          ls "$(dirname "$(readlink -f "$(which clang)")")" | grep -E 'ld64\.lld'
 
       - name: Static precheck (no SDK needed)
         run: make precheck
 
-      - name: Build injectable dylib (arm64)
+      - name: Build injectable dylib (arm64; auto-fetches SDK on first run)
         run: make dylib
 
       - name: Build .deb (rootful; 巨魔/自签注入只用上面的 dylib)

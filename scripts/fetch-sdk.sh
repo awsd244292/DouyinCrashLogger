@@ -2,16 +2,19 @@
 #
 # fetch-sdk.sh — 一次性拉取 iPhoneOS SDK（本地纯 clang 交叉编译只需这一份）
 #
-# 设计目标（对齐 PerfDebugPlugin 的本地真机级构建思路）：
+# 设计目标（对齐《28-非macOS编译iOS-dylib方案》）：
 #   1. 不依赖 Theos / macOS，Linux 也能跑；
 #   2. 只取一个 SDK（~220MB），不把整个 sdks 仓库拖下来；
-#   3. 多通道 + 超时回退：git 稀疏克隆优先，失败回退 codeload tarball 只解包目标 SDK。
+#   3. 多通道 + 超时回退：git 稀疏克隆优先，失败回退 codeload tarball 只解包目标 SDK；
+#   4. 网络超时即换通道，不在网络上耗时间。
 #
-# 用法： make fetch-sdk   （或直接 bash scripts/fetch-sdk.sh）
+# 用法： make fetch-sdk                   （默认 iPhoneOS14.5.sdk）
+#        make fetch-sdk SDK_VERSION=iPhoneOS16.5.sdk
+#        bash scripts/fetch-sdk.sh iPhoneOS16.5.sdk
 #
 set -u
 
-SDK_NAME="${1:-iPhoneOS14.5.sdk}"
+SDK_NAME="${1:-${SDK_VERSION:-iPhoneOS14.5.sdk}}"
 DEST_PARENT="${PDP_SDKS_DIR:-$HOME/.pdp-sdks}"
 DEST="$DEST_PARENT/$SDK_NAME"
 GIT_TIMEOUT=240   # git 协议在本机偶尔抖，超过这个时间直接换通道
