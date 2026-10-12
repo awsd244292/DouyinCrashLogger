@@ -172,16 +172,23 @@ static void dcl_ss_memory(NSNotification *n) {
             { UIApplicationWillEnterForegroundNotification,                dcl_ss_foreground   },
             { UIApplicationWillResignActiveNotification,                   dcl_ss_resign_active},
             { UIApplicationDidBecomeActiveNotification,                    dcl_ss_become_active},
-            { UIApplicationProtectedDataWillBecomeUnavailableNotification, dcl_ss_lock         },
-            { UIApplicationProtectedDataDidBecomeAvailableNotification,    dcl_ss_unlock       },
+            // 注意：这两个常量的真实名字不带 Notification 后缀 ——
+            // UIApplicationProtectedDataWillBecomeUnavailable / ...DidBecomeAvailable。
+            // 与其余生命周期通知的命名并不一致，写错会让编译直接挂掉。
+            { UIApplicationProtectedDataWillBecomeUnavailable, dcl_ss_lock         },
+            { UIApplicationProtectedDataDidBecomeAvailable,    dcl_ss_unlock       },
             { UIApplicationDidReceiveMemoryWarningNotification,            dcl_ss_memory       },
         };
         for (NSUInteger i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
             if (!pairs[i].name) continue;
+            // 先把函数指针取到局部变量再进 block：block 不允许引用数组类型的声明
+            //（clang: cannot refer to declaration with an array type inside block），
+            // 而 pairs[i].fn 的求值路径要经过数组。取出来之后捕获的是普通指针，合法。
+            void (*fn)(NSNotification *) = pairs[i].fn;
             [nc addObserverForName:pairs[i].name
                             object:nil
                              queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *n) { pairs[i].fn(n); }];
+                        usingBlock:^(NSNotification *n) { if (fn) fn(n); }];
             g_ss_count++;
         }
 
