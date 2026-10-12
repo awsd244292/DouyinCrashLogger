@@ -84,6 +84,11 @@ required=(
     checkCaptureProfile
     enabledCapabilities
     disabledCapabilities
+    # —— 摇一摇热切换（三指方案已废弃并删除）——
+    dcl_hs_is_shake
+    dcl_hs_show_toast
+    dcl_hs_announce
+    dcl_hs_make_toast_window
 )
 
 # 2b) 退出判定修正必须以 NSUserDefaults key 的形式落到二进制里，
@@ -126,6 +131,15 @@ for s in DCLCrashLogViewer; do
     case "$all" in
         *"$s"*) bad "仍存在 $s（极简版不应包含该符号）" ;;
         *)      pass "无 $s（已移除）" ;;
+    esac
+done
+
+# 三指状态机的残留：1.5 起热切换改用摇一摇，三指那套状态变量必须清零。
+# 只查变量符号（DCL_HS_FINGERS 是 static const 常量，编译后本就不产生符号，查了无意义）。
+for s in dcl_hs_gesture_start; do
+    case "$all" in
+        *"$s"*) bad "仍存在 $s（三指方案已废弃，热切换已改摇一摇）" ;;
+        *)      pass "无 $s（三指方案已清除）" ;;
     esac
 done
 
