@@ -40,6 +40,7 @@
 #import "DCLHotSwitch.h"
 #import "DCLLogger.h"
 #import "DCLSystemSignal.h"
+#import "DCLTimelinePersist.h"
 
 __attribute__((constructor)) static void dcl_entry(void) {
     @try {
@@ -82,6 +83,11 @@ __attribute__((constructor)) static void dcl_entry(void) {
             // 系统层信号探针：只注册通知 + 只读 runtime 查询，零方法交换，
             // 所以两档方案都装 —— 它是「自研播放器钩不到」时的兜底证据来源。
             [DCLSystemSignal install];
+
+            // 时间线持久化：把内存里的环形缓冲周期落到磁盘。两档都开 ——
+            // 它被杀的那一刻（OOM / watchdog / 用户上滑）最后几秒的上下文
+            // 只有磁盘上的那一份能活下来，这是整条时间线唯一扛得住进程死亡的形式。
+            [DCLTimelinePersist startWithDirectory:[DCLCrashReporter crashLogsDirectory]];
 
             // 播放探针会交换 AVPlayer / UIApplication 的方法实现 —— 只有 B 方案（full）才装。
             // A 方案（safe）下这一分支不执行，本进程内不会有任何方法交换。

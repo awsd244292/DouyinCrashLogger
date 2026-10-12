@@ -67,6 +67,27 @@ BOOL DCLReplaceInstanceMethod(Class cls,
 /// （面向人读的结构化报告 latest.log 仍保留中文 UTF-8，不走这里。）
 NSString *DCLASCIISanitized(NSString * _Nullable s);
 
+#pragma mark - async-signal-safe 文本拼接
+
+// 下面这几个不是「简化版 snprintf」，而是**唯一允许**用在某些上下文里的那套东西：
+// 信号处理器里能调的函数由 POSIX 明文规定（sigaction(2) 手册有清单），
+// snprintf 不在其中 —— 它可能触碰 locale、也可能在内部分配缓冲。
+// 现实很骨感：这类违规平时测不出来，只在真崩溃那一刻失真，
+// 而那正是最需要证据准确的时刻。所以宁可手写、宁可啰嗦。
+//
+// 全部约定：调用方提供目标缓冲与其容量，函数只负责按容量追加并返回新偏移，
+// 绝不分配内存、绝不触碰 locale、绝不调用任何 ObjC。
+
+/// 安全的strlen（容忍 NULL）
+size_t DCLStrLenSafe(const char * _Nullable s);
+
+/// 追加字符串到 buf[off]，返回新偏移。容量不足时按边界截断，绝不越界写。
+size_t DCLAppendStr(char *buf, size_t off, size_t cap, const char * _Nullable src);
+
+/// 十进制格式化（含负数处理：刻意绕开 -INT64_MIN 溢出）
+size_t DCLU64ToDec(uint64_t v, char *out, size_t cap);
+size_t DCLI64ToDec(int64_t v, char *out, size_t cap);
+
 NS_ASSUME_NONNULL_END
 
 #endif /* DCLSupport_h */

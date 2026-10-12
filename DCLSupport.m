@@ -64,6 +64,65 @@ BOOL DCLReplaceInstanceMethod(Class cls,
     return YES;
 }
 
+#pragma mark - async-signal-safe 文本拼接
+
+// 说明见 DCLSupport.h。要点只有一个：这些函数是给信号处理器用的，
+// 因此绝不分配、绝不触碰 locale、绝不经 ObjC 派发。
+
+size_t DCLStrLenSafe(const char *s) {
+    size_t n = 0;
+    if (!s) return 0;
+    while (s[n]) n++;
+    return n;
+}
+
+size_t DCLAppendStr(char *buf, size_t off, size_t cap, const char *src) {
+    if (!buf || cap == 0) return 0;
+    if (off >= cap - 1) return off;      // 已无可用空间（留 1 字节给结尾）
+    size_t i = off;
+    size_t last = cap - 1;
+    if (!src) return off;
+    while (*src && i < last) {
+        buf[i++] = *src++;
+    }
+    buf[i] = '\0';
+    return i;
+}
+
+size_t DCLU64ToDec(uint64_t v, char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    char tmp[24];
+    size_t k = 0;
+    if (v == 0) {
+        tmp[k++] = '0';
+    } else {
+        while (v > 0 && k < sizeof(tmp)) {
+            tmp[k++] = (char)('0' + (int)(v % 10ULL));
+            v /= 10ULL;
+        }
+    }
+    size_t n = k < cap ? k : cap;
+    // 逆序写回：tmp 里是低位在前
+    for (size_t i = 0; i < n; i++) {
+        out[i] = tmp[n - 1 - i];
+    }
+    if (n < cap) out[n] = '\0';
+    return n;
+}
+
+size_t DCLI64ToDec(int64_t v, char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    if (v < 0) {
+        if (cap < 2) { out[0] = '\0'; return 0; }
+        out[0] = '-';
+        // 先 +1 再取负：-INT64_MIN 直接取负会溢出到它自己
+        uint64_t u = (uint64_t)(-(v + 1)) + 1ULL;
+        size_t n = DCLU64ToDec(u, out + 1, cap - 1);
+        return n + 1;
+    }
+    return DCLU64ToDec((uint64_t)v, out, cap);
+}
+
 NSString *DCLASCIISanitized(NSString * _Nullable s) {
     if (!s || s.length == 0) return @"";
 

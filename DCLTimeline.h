@@ -29,6 +29,20 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// 单条时间线事件。刻意做成 POD 结构并在头文件公开：
+/// 崩溃上下文要能直接读到它 —— 那时不能用 ObjC、不能分配内存、也不能碰锁。
+#define DCL_TL_DETAIL_LEN   96    ///< 单条事件说明的最大长度（含结尾 \0）
+#define DCL_TL_CAPACITY    512    ///< 环形缓冲槽位数（超出覆盖最旧）
+
+typedef struct {
+    uint64_t mono_ns;                       ///< 单调时间（纳秒）
+    uint64_t wall_ms;                       ///< 墙钟时间（毫秒，unix epoch）
+    uint32_t kind;                          ///< DCLTimelineEventKind
+    uint32_t seq;                           ///< 全局递增序号
+    int32_t  aux;                           ///< 数值辅助字段
+    char     detail[DCL_TL_DETAIL_LEN];     ///< 短说明
+} DCLTimelineEntry;
+
 /// 时间线事件类型。
 /// 命名规则：谁产生的前缀 —— Hook(方法交换) / Sys(系统通知) / App(宿主生命周期)。
 typedef NS_ENUM(uint32_t, DCLTimelineEventKind) {
@@ -74,6 +88,11 @@ typedef NS_ENUM(uint32_t, DCLTimelineEventKind) {
 /// 当前缓冲内保留的事件条数
 + (NSUInteger)bufferedCount;
 
+/// 把当前缓冲按时间正序拷一份出来，返回实际条数。
+/// 给持久化模块用：落盘需要原始字段（尤其是 seq 用于增量续写），
+/// 光拿到格式化好的字符串就没法做去重与增量。
++ (NSUInteger)copyEntries:(DCLTimelineEntry *)out capacity:(NSUInteger)cap;
+
 /// 导出全部事件的可读行（按时间正序）。
 /// 每行格式：`<序号> +<相对毫秒> <HH:MM:SS.mmm> <类型名> aux=<数值> <说明>`
 /// 相对毫秒以缓冲内第一条事件为基准 —— 这样「暂停前后 200ms 发生了什么」一眼可见。
@@ -109,6 +128,15 @@ typedef NS_ENUM(uint32_t, DCLTimelineEventKind) {
 /// 钩子体内专用：避免 ObjC 消息派发与对象分配，只填定长结构体。
 /// 不保证线程内不重入，但本身是单行写入，崩溃上下文里调用也安全。
 void DCLTimelineRecordC(DCLTimelineEventKind kind, int32_t aux, const char *_Nullable detail);
+
+/// 崩溃/信号上下文专用：不加锁、不分配内存，纯粹从环形缓冲顺序 read 出条目。
+///
+/// 为什么必须单独走这条路：普通快照要拿 os_unfair_lock，而崩溃可能恰好发生在
+/// 「刚拿到锁还没释放」的那一刻 —— 此时再抢同一把锁就是死锁，
+/// 本该抢救出来的最后几秒证据，反而因为抢救动作本身全丢。
+/// 代价是可能读到正在被覆盖的半旧字段（POD 结构不会有野指针风险），
+/// 跟「证据全丢」比，这点不完美完全可以接受。
+size_t DCLTimelineCopyEntriesUnsafe(DCLTimelineEntry *out, size_t cap);
 
 /// 当前单调时间（纳秒，进程内可比，已用 mach_timebase 换算过）
 uint64_t DCLTimelineMonoNow(void);

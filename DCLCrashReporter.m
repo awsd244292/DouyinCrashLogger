@@ -14,6 +14,7 @@
 #import "DCLPlaybackTracer.h"
 #import "DCLTimeline.h"
 #import "DCLSystemSignal.h"
+#import "DCLTimelinePersist.h"
 #import "DCLHealthCheck.h"
 
 #import <UIKit/UIKit.h>
@@ -306,6 +307,14 @@ static void dcl_signal_handler(int sig, siginfo_t *info, void *uctx) {
     // 因此这里刻意不用 snprintf（理由见下方注释）。
     DCLTimelineRecordC(DCLTlKindCrash, sig, dcl_signal_name(sig));
 
+    // 抢救时间线：此时缓冲区里装着崩溃前最后几秒的全部事件（播放暂停、卡顿、
+    // 触摸、前后台……）。不写出去，进程一死就全蒸发 —— 而这几秒恰恰是
+    // 归因最值钱的部分。必须在上面那条 Crash 打点之后调，好让「崩溃」本身
+    // 也进到这份现场里。
+    // 该函数的实现只用 open/write/close，不得引入任何非 async-signal-safe 的东西。
+    const char *tlPath = DCLTimelineCrashDumpPath();
+    if (tlPath) DCLTimelineEmergencyDump(tlPath);
+
     // 信号处理器内不使用 snprintf：它不在 POSIX async-signal-safe 白名单里，
     // 格式化可能触碰 locale / 内部分配。一律手工拼接（无锁、无分配、无 locale）。
     char type[48];
@@ -384,6 +393,12 @@ static void dcl_uncaught_exception_handler(NSException *exception) {
             snprintf(cbuf, sizeof(cbuf), "未捕获异常 %s",
                      exception.name ? exception.name.UTF8String : "(无名)");
             DCLTimelineRecordC(DCLTlKindCrash, 0, cbuf);
+
+            // OC 异常最终也会转 SIGABRT 走信号路径，但那一步可能因为各种原因
+            // （宿主顶掉了信号处理器、abort 被拦截）到不了。这里先自行抢救一次：
+            // 同一份证据有两条独立写出的路径，比只有一条可靠。
+            const char *tlPath = DCLTimelineCrashDumpPath();
+            if (tlPath) DCLTimelineEmergencyDump(tlPath);
 
             // OC 异常路径无信号重入风险，用 Foundation 写出可读性更高的报告
             NSString *dir = [DCLCrashReporter crashLogsDirectory];
@@ -1084,6 +1099,14 @@ static void dcl_prepare_meta(void) {
         for (NSString *l in ctx) [s appendFormat:@"%@\n", l];
     } else if ([DCLTimeline avPlayerSeen]) {
         [s appendString:@"\n（暂停钩子本会话未命中过，故无「暂停前上下文」可给）\n"];
+    }
+
+    // 上次崩溃抢救出来的现场。这一段信息密度最高：
+    // 它记录的是进程死之前最后几秒 —— 而那几秒在崩溃报告里通常是一片空白。
+    NSString *crashTl = [DCLTimelinePersist takeLastCrashTimeline];
+    if (crashTl.length) {
+        [s appendString:@"\n---------- 上次崩溃前的最后现场（崩溃瞬间抢出，非推测）----------\n"];
+        [s appendFormat:@"%@\n", crashTl];
     }
 }
 

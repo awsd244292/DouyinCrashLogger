@@ -25,17 +25,9 @@
 #import <sys/time.h>
 #import <string.h>
 
-#define DCL_TL_CAP     512    ///< 环形缓冲槽位数（约 512 条，超出覆盖最旧）
-#define DCL_TL_DETAIL   96    ///< 单条事件说明的最大长度（含结尾 \0）
-
-typedef struct {
-    uint64_t mono_ns;                  ///< 单调时间（纳秒）
-    uint64_t wall_ms;                  ///< 墙钟时间（毫秒，unix epoch）
-    uint32_t kind;                     ///< DCLTimelineEventKind
-    uint32_t seq;                      ///< 全局递增序号
-    int32_t  aux;                      ///< 数值辅助字段（卡顿毫秒 / rate*100 / 中断类型…）
-    char     detail[DCL_TL_DETAIL];    ///< 短说明
-} DCLTlEntry;
+// 槽位容量与说明字段长度见 DCLTimeline.h —— 那边要把它暴露给崩溃上下文的落盘路径，
+// 这里就不再重复定义一份（重复宏一旦改歪一处，两边结构体布局立刻错位）。
+typedef DCLTimelineEntry DCLTlEntry;
 
 static DCLTlEntry   g_buf[DCL_TL_CAP];
 static uint32_t     g_head  = 0;   ///< 下一个写入的槽位
@@ -88,17 +80,37 @@ void DCLTimelineRecordC(DCLTimelineEventKind kind, int32_t aux, const char *deta
 
 #pragma mark - 内部：快照拷贝
 
+/// 计算缓冲读取的起点与有效条数。崩溃路径与普通路径共用一段换算，避免两处写歪。
+static inline void dcl_tl_range(uint32_t *outStart, NSUInteger *outCount) {
+    NSUInteger n = g_total > (uint64_t)DCL_TL_CAP ? (NSUInteger)DCL_TL_CAP : (NSUInteger)g_total;
+    NSUInteger start = (NSUInteger)((g_head + DCL_TL_CAP - (uint32_t)n) % DCL_TL_CAP);
+    *outStart = (uint32_t)start;
+    *outCount = n;
+}
+
 /// 把当前缓冲按时间正序拷一份出来，返回条数。
 static NSUInteger dcl_tl_snapshot(DCLTlEntry *out, NSUInteger cap) {
     if (!out || cap == 0) return 0;
     os_unfair_lock_lock(&g_lock);
-    NSUInteger n = g_total > (uint64_t)DCL_TL_CAP ? (NSUInteger)DCL_TL_CAP : (NSUInteger)g_total;
-    NSUInteger start = (NSUInteger)((g_head + DCL_TL_CAP - (uint32_t)n) % DCL_TL_CAP);
+    NSUInteger start = 0, n = 0;
+    dcl_tl_range(&start, &n);
     NSUInteger m = n < cap ? n : cap;
     for (NSUInteger i = 0; i < m; i++) {
         out[i] = g_buf[(start + i) % DCL_TL_CAP];
     }
     os_unfair_lock_unlock(&g_lock);
+    return m;
+}
+
+size_t DCLTimelineCopyEntriesUnsafe(DCLTimelineEntry *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    uint32_t start = 0;
+    NSUInteger n = 0;
+    dcl_tl_range(&start, &n);
+    size_t m = n < cap ? (size_t)n : cap;
+    for (size_t i = 0; i < m; i++) {
+        out[i] = g_buf[(start + i) % DCL_TL_CAP];
+    }
     return m;
 }
 
@@ -168,6 +180,10 @@ static NSString *dcl_tl_format(const DCLTlEntry *e, uint64_t baseMono, NSUIntege
 
 + (NSUInteger)bufferedCount {
     return g_total > (uint64_t)DCL_TL_CAP ? (NSUInteger)DCL_TL_CAP : (NSUInteger)g_total;
+}
+
++ (NSUInteger)copyEntries:(DCLTimelineEntry *)out capacity:(NSUInteger)cap {
+    return dcl_tl_snapshot(out, cap);
 }
 
 + (NSArray<NSString *> *)formattedLines {
