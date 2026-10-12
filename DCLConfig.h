@@ -27,8 +27,10 @@
 //      · 卡死 / 截图时抓取全线程冻结快照 → 死锁、锁等待取证（仿 PerfDebugPlugin）
 //      所有钩子依旧严格「原样透传、零吞事件、钩子体只打点、重活丢后台队列」。
 //
-//  切换方式：编辑沙盒内 Documents/DouyinCrashLogs/capture_mode.txt，
-//  内容写 full 或 safe（# 开头的注释行与空行会被忽略），完全退出并重启抖音生效。
+//  切换方式（二选一）：
+//   1) 编辑沙盒内 Documents/DouyinCrashLogs/capture_mode.txt，
+//      内容写 full 或 safe（# 开头的注释行与空行会被忽略），完全退出并重启抖音生效。
+//   2) App 内三指轻点：直接翻转档位，震 3 下反馈，免文件、免重启（详见 DCLHotSwitch）。
 //  文件不存在时按 safe 运行，并在首次运行时自动生成一份带说明的默认文件，方便直接改。
 //
 //  设计铁律：无论哪一档，捕获链路（信号 / 异常处理器）都始终安装 ——
@@ -72,6 +74,13 @@ typedef NS_ENUM(NSUInteger, DCLCaptureProfile) {
 
 /// 切换方式说明（写进日志，避免用户忘了怎么改回来）
 + (NSString *)switchGuide;
+
+/// 立即设定采集方案（绕过只读缓存，热切换用）。
+/// 双写 NSUserDefaults 与 capture_mode.txt —— 即使完全退出重启抖音也保持生效。
++ (void)setProfile:(DCLCaptureProfile)profile;
+
+/// 在 safe / full 之间翻转（三指轻点热切换入口）
++ (void)toggleProfile;
 
 @end
 

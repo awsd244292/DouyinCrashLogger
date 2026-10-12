@@ -18,6 +18,12 @@
 #import "DCLConstants.h"
 
 #import <sys/stat.h>
+#import <stdatomic.h>
+
+/// 当前生效方案缓存：原子值，支持热切换即时翻面（见 setProfile: / toggleProfile）。
+/// 初值由 captureProfile 首次调用时从开关文件读取并写入；之后读一律走原子值，
+/// 不再碰盘 —— 这样热切换翻转后才能「不重启立即生效」。
+static atomic_int dcl_profile_atomic = ATOMIC_VAR_INIT((int)DCLCaptureProfileSafe);
 
 @implementation DCLConfig
 
@@ -46,6 +52,7 @@ static NSString *dcl_default_mode_file_text(void) {
             "# 两档下所有钩子均为「原样透传、零吞事件」的旁路观测；\n"
             "# 若只需证明「有没有崩 / 上次是怎么退的」，保持 safe 即可。\n"
             "#\n"
+            "# 也可在 App 内三指轻点直接翻转档位（免文件、免重启，震 3 下反馈）。\n"
             "# 修改后完全退出并重启抖音生效。\n"
             "safe\n";
 }
@@ -115,14 +122,42 @@ static DCLCaptureProfile dcl_read_profile(void) {
 }
 
 + (DCLCaptureProfile)captureProfile {
-    static DCLCaptureProfile cached = DCLCaptureProfileSafe;
     static dispatch_once_t once;
     // 用 dispatch_once 而非 __sync：构造期与多线程同时首次调用都要保证只读一次盘
     dispatch_once(&once, ^{
-        @try { cached = dcl_read_profile(); }
-        @catch (id e) { (void)e; cached = DCLCaptureProfileSafe; }
+        @try { atomic_store(&dcl_profile_atomic, (int)dcl_read_profile()); }
+        @catch (id e) { (void)e; atomic_store(&dcl_profile_atomic, (int)DCLCaptureProfileSafe); }
     });
-    return cached;
+    return (DCLCaptureProfile)atomic_load(&dcl_profile_atomic);
+}
+
+#pragma mark - 热切换（即时生效）
+
++ (void)setProfile:(DCLCaptureProfile)profile {
+    // 先翻原子值：此后所有 captureProfile 调用立即见到新值，无需重启
+    atomic_store(&dcl_profile_atomic, (int)profile);
+    @try {
+        // 双写持久层：NSUserDefaults（备选通道）+ capture_mode.txt（优先通道），
+        // 保证完全退出重启抖音后依然保持本次选择。
+        NSString *text = (profile == DCLCaptureProfileFull) ? @"full\n" : @"safe\n";
+        NSString *path = [self modeFilePath];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm createDirectoryAtPath:[path stringByDeletingLastPathComponent]
+          withIntermediateDirectories:YES
+                               attributes:nil
+                                    error:nil];
+        [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+        NSString *v = (profile == DCLCaptureProfileFull) ? @"full" : @"safe";
+        [[NSUserDefaults standardUserDefaults] setObject:v forKey:DCLCaptureModeDefaultsKey];
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
++ (void)toggleProfile {
+    DCLCaptureProfile cur = [self captureProfile];
+    [self setProfile:(cur == DCLCaptureProfileFull ? DCLCaptureProfileSafe : DCLCaptureProfileFull)];
 }
 
 #pragma mark - 能力矩阵

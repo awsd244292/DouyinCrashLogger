@@ -32,6 +32,7 @@
 #import "DCLWatchdog.h"
 #import "DCLPlaybackTracer.h"
 #import "DCLConfig.h"
+#import "DCLHotSwitch.h"
 
 __attribute__((constructor)) static void dcl_entry(void) {
     @try {
@@ -59,6 +60,10 @@ __attribute__((constructor)) static void dcl_entry(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @try {
+            // 热切换：三指轻点 → 翻转 safe/full → 震 3 下。始终安装、独立于档位，
+            // 否则 safe 档下用户将无法切到 full（详见 DCLHotSwitch.h）。
+            [DCLHotSwitch install];
+
             // 看门狗：只挂 CFRunLoopObserver（公开 API，非 hook），两档方案都装 ——
             // 「卡了多久」是最基础的事实，没有理由因为方案降级而放弃。
             [DCLWatchdog install];

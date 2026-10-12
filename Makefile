@@ -18,7 +18,8 @@ STRIP = echo
 #   DCLPlaybackTracer.m  —— 视频暂停归因探针（hook AVPlayer / UIApplication.sendEvent:）
 #   DCLHealthCheck.m     —— 触发式健康自检（证明插件自身在工作）
 #   DCLConfig.m          —— 两档采集方案开关（A 零 hook / B hook 全开），决定后两者装不装
-DouyinCrashLogger_FILES := DCLMain.m DCLConstants.m DCLCrashReporter.m DCLWatchdog.m DCLPlaybackTracer.m DCLHealthCheck.m DCLConfig.m
+#   DCLHotSwitch.m       —— 三指轻点热切换（始终安装，独立于档位，免文件免重启）
+DouyinCrashLogger_FILES := DCLMain.m DCLConstants.m DCLCrashReporter.m DCLWatchdog.m DCLPlaybackTracer.m DCLHealthCheck.m DCLConfig.m DCLHotSwitch.m
 
 DouyinCrashLogger_CFLAGS := -fobjc-arc -O0 -Wno-deprecated-declarations
 DouyinCrashLogger_LDFLAGS :=
@@ -28,7 +29,9 @@ include $(THEOS)/makefiles/common.mk
 # 仅依赖系统框架，不链接 substrate
 # AVFoundation：DCLPlaybackTracer 通过运行时 hook AVPlayer，需其头文件；
 # 实际符号全部经 ObjC runtime / NSClassFromString 解析，不引入链接依赖（-undefined dynamic_lookup 兜底）。
-DouyinCrashLogger_FRAMEWORKS := UIKit Foundation AVFoundation
+# AudioToolbox：热切换的震动反馈用到 AudioServicesPlaySystemSound。
+# 注意：FRAMEWORKS 同名变量重复赋值后者覆盖前者，故全部依赖框架统一在此一处声明。
+DouyinCrashLogger_FRAMEWORKS := UIKit Foundation AVFoundation AudioToolbox
 # 关键：不定义 LIBRARIES，避免 -lsubstrate；tweak.mk 的 -undefined dynamic_lookup 即可，
 # 由于我们从不引用任何 substrate 符号，dyld 在纯自签环境下也能正常加载。
 
