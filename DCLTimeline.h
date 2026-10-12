@@ -58,6 +58,7 @@ typedef NS_ENUM(uint32_t, DCLTimelineEventKind) {
     // —— 本模块自身事件 ——
     DCLTlKindCrash            = 15,  ///< 崩溃发生（信号 / OC 异常）
     DCLTlKindSnapshot         = 16,  ///< 生成 latest.log
+    DCLTlKindHookInstalled    = 17,  ///< 播放器钩子挂载完成（含延迟补挂）
 };
 
 @interface DCLTimeline : NSObject

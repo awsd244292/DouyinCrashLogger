@@ -936,6 +936,22 @@ static void dcl_prepare_meta(void) {
     NSArray<DCLPauseEvent *> *events = [DCLPlaybackTracer recentEvents];
     NSArray<DCLStallRecord *> *stalls = [DCLWatchdog recentStalls];
 
+    // 先交代「钩子蹲在哪几层」，再谈抓没抓到 —— 取证的结论必须能被独立验证。
+    // 只输出「未观测到暂停」，用户看到的永远是「插件没干活」；
+    // 而真相常常是「钩子压根不在调用路径上」，两者处置方向完全相反。
+    if (hooksOn) {
+        NSArray<NSString *> *hooked = [DCLPlaybackTracer hookedPlayerClasses];
+        NSArray<NSString *> *skipped = [DCLPlaybackTracer skippedPlayerClasses];
+        [s appendFormat:@"播放钩子挂载层：共 %lu 个方法，落在 %@\n",
+         (unsigned long)[DCLPlaybackTracer hookedCount],
+         hooked.count ? [hooked componentsJoinedByString:@", "] : @"（尚未挂上任何类）"];
+        if (skipped.count) {
+            [s appendFormat:@"  未单独挂载的类：%@\n"
+                            @"  （多为子类未自己实现这些方法 —— 消息走继承链时已由父类钩子覆盖，属预期）\n",
+             [skipped componentsJoinedByString:@", "]];
+        }
+    }
+
     if (events.count == 0 && stalls.count == 0) {
         if (!hooksOn) {
             [s appendString:@"结论：无（本次会话未观测到主线程卡死；"
@@ -980,6 +996,11 @@ static void dcl_prepare_meta(void) {
         [s appendFormat:@"\n[暂停事件] %@  action=%@  rate %.2f→%.2f  %@\n",
          [df stringFromDate:d], e.action, e.rateBefore, e.rateAfter,
          e.onMainThread ? @"(主线程)" : @"(非主线程)"];
+        // 命中类名是这一版最值钱的新信息：暂停究竟由哪一层发起，
+        // 直接决定下一步是查抖音业务逻辑还是查某个注入模块。
+        if (e.playerClass.length) {
+            [s appendFormat:@"  命中类：%@\n", e.playerClass];
+        }
 
         NSString *src = @"";
         switch (e.source) {

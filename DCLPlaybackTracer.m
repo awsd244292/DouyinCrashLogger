@@ -7,6 +7,7 @@
 #import "DCLWatchdog.h"
 #import "DCLSupport.h"   // DCLNowUs / DCLReplaceInstanceMethod —— 不再各模块自己抄一份
 #import "DCLTimeline.h"  // 所有探针共用同一条时间线 —— 事件必须能在同一条轴上比对
+#import "DCLSystemSignal.h"  // 复用 AVPlayer 子类枚举（只读 runtime，零 hook）
 
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -30,10 +31,41 @@ static dispatch_queue_t g_symbolQueue = NULL;
 static volatile int32_t g_installed = 0;
 static volatile uint32_t g_hook_count = 0;
 
-// 原始实现。刻意只 hook AVPlayer 基类：
-// 若同时对多个自研播放器类替换同名 selector，它们的原始实现要共用同一个静态变量，
-// 一旦某个类的实现被后来的覆盖，调用链就会指错 — 那是实质性的崩溃风险。
-// AVPlayer 是 iOS 视频播放的事实底层，继承自它的自研播放器会被自动覆盖。
+#pragma mark - 播放器类绑定表（每个类各存一份原始实现）
+
+// 为什么必须给「每个类」单独存一份原始实现：
+//   过去所有钩子共用一个静态变量存 orig，于是只能挂 AVPlayer 一个基类。
+//   但真机日志摆在这儿：运行时枚举到 HTSMediaMixPlayer / ISAVPlayer /
+//   BDByteCastAVPlayer 等多个 AVPlayer 子类。子类一旦自己重写了 -pause 且不调 super，
+//   消息就根本不会经过基类 —— 基类钩子形同虚设，视频停了却一条也抓不到。
+//   而共享静态变量时给多个类替换同名 selector，后挂的会把先挂的 orig 覆盖掉，
+//   调用链直接指错 —— 那是真崩溃风险，不是「可能」。
+//   改成每个类一条绑定记录、各自持有自己的 orig，冲突从结构上就消失了。
+//
+// 安全边界：只对「自己实现了该方法」的类动手（DCLReplaceInstanceMethod 内部有此检查）。
+//   子类没实现 pause → 消息本来就走继承来的实现（也就是我们挂在父类上的钩子），
+//   既不重复挂，也不会形成自环。
+
+#define DCL_MAX_PLAYER_CLASS 24
+
+typedef struct {
+    Class  cls;                 // NULL 表示空槽
+    char   clsName[64];         // 钩子体内要写字面量到时间线，用 C 字符串避免任何内存分配
+    void  *orig_pause;
+    void  *orig_play;
+    void  *orig_setRate;
+    void  *orig_replaceItem;
+    void  *orig_initWithItem;
+    void  *orig_initWithURL;
+} DCLPlayerBinding;
+
+static DCLPlayerBinding g_bindings[DCL_MAX_PLAYER_CLASS];
+// 只在挂载阶段（主线程串行）写；钩子体读取时用原子读。
+// 顺序保证：先填完结构体内容，再推进计数 —— 读者看到计数就能安全读内容。
+static volatile int32_t g_binding_count = 0;
+
+// 尝试过但未挂上的类名（多为该类并未自己实现这些方法），留个出口便于事后核对。
+static NSMutableArray<NSString *> *g_skipped = nil;
 
 // 抑制表：同一 player 实例 500ms 窗口内只记一次。
 // 刻意用定长 C 数组而非 NSMutableDictionary —— 钩子体里不做任何内存分配、不拿锁。
@@ -61,7 +93,7 @@ static BOOL dcl_is_path_third_party(const char *p) {
 }
 
 /// 后台队列里执行：符号化 + 归因
-static void dcl_enqueue(NSString *action, float before, float after,
+static void dcl_enqueue(NSString *action, const char *clsName, float before, float after,
                         BOOL onMain, uint64_t nowUs, void **frames, int nframes) {
     if (!g_symbolQueue) return;
     uintptr_t addrs[DCL_BT_DEPTH];
@@ -186,6 +218,7 @@ static void dcl_enqueue(NSString *action, float before, float after,
             e.unixTime = (NSTimeInterval)(nowUs / 1000000ULL)
                        + (NSTimeInterval)(nowUs % 1000000ULL) / 1000000.0;
             e.action = action;
+            e.playerClass = clsName ? [NSString stringWithUTF8String:clsName] : @"";
             e.rateBefore = before;
             e.rateAfter = after;
             e.onMainThread = onMain;
@@ -205,7 +238,8 @@ static void dcl_enqueue(NSString *action, float before, float after,
 }
 
 /// 钩子体的公共部分：轻量打点 + 收集回溯地址 + 入队
-static inline void dcl_capture(id player, NSString *action, float before, float after) {
+static inline void dcl_capture(id player, NSString *action, const char *clsName,
+                               float before, float after) {
     // 重入保护：宿主原实现内部可能再次调用被钩方法（典型如 setRate: 内部走 pause）。
     // 刻意用线程局部变量而非全局标志 —— 钩子完全可能在多个线程并发进入，
     // 全局标志会把其他线程本该正常记录的调用也一并挡掉。
@@ -241,9 +275,11 @@ static inline void dcl_capture(id player, NSString *action, float before, float 
         DCLTimelineEventKind k = DCLTlKindPauseHook;
         if ([action isEqualToString:@"play"]) k = DCLTlKindPlayHook;
         else if ([action hasPrefix:@"replaceCurrentItem"]) k = DCLTlKindItemReplace;
-        char tbuf[96];
-        snprintf(tbuf, sizeof(tbuf), "%s rate=%.2f %s",
-                 action.UTF8String, (double)after, [NSThread isMainThread] ? "主线程" : "子线程");
+        char tbuf[128];
+        snprintf(tbuf, sizeof(tbuf), "%s rate=%.2f %s class=%s",
+                 action.UTF8String, (double)after,
+                 [NSThread isMainThread] ? "主线程" : "子线程",
+                 clsName ?: "(未绑定)");
         DCLTimelineRecordC(k, (int32_t)(after * 100.0f), tbuf);
 
         // 栈上缓冲：绝不能用 static —— AVPlayer 的回调常在非主线程并发触发，
@@ -252,7 +288,7 @@ static inline void dcl_capture(id player, NSString *action, float before, float 
         void *frames[DCL_BT_DEPTH];
         int n = backtrace(frames, DCL_BT_DEPTH);
         BOOL onMain = [NSThread isMainThread];
-        dcl_enqueue(action, before, after, onMain, now, frames, n);
+        dcl_enqueue(action, clsName, before, after, onMain, now, frames, n);
     }
 
     in_hook = 0;
@@ -260,28 +296,61 @@ static inline void dcl_capture(id player, NSString *action, float before, float 
 
 #pragma mark - 钩子实现（全部原样透传，绝不吞事件）
 
-static void (*dcl_orig_pause_fn)(id, SEL) = NULL;
+typedef void (*DCLVoidImp)(id, SEL);
+typedef void (*DCLSetRateImp)(id, SEL, float);
+typedef void (*DCLPtrArgImp)(id, SEL, id);
+typedef id   (*DCLInitImp)(id, SEL, id);
+
+/// 某个类是否已挂过钩子（挂载阶段用：重复替换同名 selector 会形成自环）
+static DCLPlayerBinding *dcl_binding_for_class(Class cls) {
+    if (!cls) return NULL;
+    int32_t n = g_binding_count;
+    for (int32_t i = 0; i < n; i++) {
+        if (g_bindings[i].cls == cls) return &g_bindings[i];
+    }
+    return NULL;
+}
+
+/// 实例 → 绑定记录：沿继承链向上找最近一个挂了钩子的类。
+/// 必须走继承链，因为以下两种情况精确匹配会落空：
+///   1) KVO 是运行时搞出来的动态子类（NSKVONotifying_Xxx），表里查不到它，
+///      它的父类才是我们挂钩子那一层；
+///   2) 迟到的子类在被补挂之前就已实例化，此刻它走的是继承来的钩子，
+///      按父类记录转发同样正确。
+/// 正常情况下必然找得到 —— 能进到钩子函数，就说明某个类的方法 IMP 已被替换成它。
+static DCLPlayerBinding *dcl_binding_for_object(id obj) {
+    if (!obj) return NULL;
+    Class cls = object_getClass(obj);
+    while (cls) {
+        DCLPlayerBinding *b = dcl_binding_for_class(cls);
+        if (b) return b;
+        cls = class_getSuperclass(cls);
+    }
+    return NULL;
+}
+
 static void dcl_pause(id self, SEL _cmd) {
-    dcl_capture(self, @"pause", 0.0f, 0.0f);
-    if (dcl_orig_pause_fn) dcl_orig_pause_fn(self, _cmd);
+    DCLPlayerBinding *b = dcl_binding_for_object(self);
+    dcl_capture(self, @"pause", b ? b->clsName : NULL, 0.0f, 0.0f);
+    if (b && b->orig_pause) ((DCLVoidImp)b->orig_pause)(self, _cmd);
 }
 
-static void (*dcl_orig_play_fn)(id, SEL) = NULL;
 static void dcl_play(id self, SEL _cmd) {
-    dcl_capture(self, @"play", 0.0f, 1.0f);
-    if (dcl_orig_play_fn) dcl_orig_play_fn(self, _cmd);
+    DCLPlayerBinding *b = dcl_binding_for_object(self);
+    dcl_capture(self, @"play", b ? b->clsName : NULL, 0.0f, 1.0f);
+    if (b && b->orig_play) ((DCLVoidImp)b->orig_play)(self, _cmd);
 }
 
-static void (*dcl_orig_setRate_fn)(id, SEL, float) = NULL;
 static void dcl_setRate(id self, SEL _cmd, float rate) {
-    dcl_capture(self, @"setRate:", 0.0f, rate);
-    if (dcl_orig_setRate_fn) dcl_orig_setRate_fn(self, _cmd, rate);
+    DCLPlayerBinding *b = dcl_binding_for_object(self);
+    dcl_capture(self, @"setRate:", b ? b->clsName : NULL, 0.0f, rate);
+    if (b && b->orig_setRate) ((DCLSetRateImp)b->orig_setRate)(self, _cmd, rate);
 }
 
-static void (*dcl_orig_replaceItem_fn)(id, SEL, id) = NULL;
 static void dcl_replaceItem(id self, SEL _cmd, AVPlayerItem *item) {
-    dcl_capture(self, @"replaceCurrentItemWithPlayerItem:", 0.0f, 0.0f);
-    if (dcl_orig_replaceItem_fn) dcl_orig_replaceItem_fn(self, _cmd, item);
+    DCLPlayerBinding *b = dcl_binding_for_object(self);
+    dcl_capture(self, @"replaceCurrentItemWithPlayerItem:", b ? b->clsName : NULL, 0.0f, 0.0f);
+    if (b && b->orig_replaceItem) ((DCLPtrArgImp)b->orig_replaceItem)(self, _cmd, item);
 }
 
 #pragma mark - AVPlayer 实例化探针（坐实「抖音走不走系统播放器」）
@@ -294,17 +363,21 @@ static void dcl_replaceItem(id self, SEL _cmd, AVPlayerItem *item) {
 //          别再往 AVPlayer 上加钩子了，加多少都是零。
 // 相比纯经验判断「抖音大概不用 AVPlayer」，这给了个可验证的事实。
 
-static id (*dcl_orig_initWithItem_fn)(id, SEL, id) = NULL;
 static id dcl_initWithItem(id self, SEL _cmd, AVPlayerItem *item) {
-    DCLTimelineRecordC(DCLTlKindAVPlayerSeen, 1, "initWithPlayerItem: 被创建");
-    if (dcl_orig_initWithItem_fn) return dcl_orig_initWithItem_fn(self, _cmd, item);
+    DCLPlayerBinding *b = dcl_binding_for_object(self);
+    char tbuf[128];
+    snprintf(tbuf, sizeof(tbuf), "%s 由 initWithPlayerItem: 创建", b ? b->clsName : "(未绑定)");
+    DCLTimelineRecordC(DCLTlKindAVPlayerSeen, 1, tbuf);
+    if (b && b->orig_initWithItem) return ((DCLInitImp)b->orig_initWithItem)(self, _cmd, item);
     return nil;
 }
 
-static id (*dcl_orig_initWithURL_fn)(id, SEL, id) = NULL;
 static id dcl_initWithURL(id self, SEL _cmd, NSURL *url) {
-    DCLTimelineRecordC(DCLTlKindAVPlayerSeen, 2, "initWithURL: 被创建");
-    if (dcl_orig_initWithURL_fn) return dcl_orig_initWithURL_fn(self, _cmd, url);
+    DCLPlayerBinding *b = dcl_binding_for_object(self);
+    char tbuf[128];
+    snprintf(tbuf, sizeof(tbuf), "%s 由 initWithURL: 创建", b ? b->clsName : "(未绑定)");
+    DCLTimelineRecordC(DCLTlKindAVPlayerSeen, 2, tbuf);
+    if (b && b->orig_initWithURL) return ((DCLInitImp)b->orig_initWithURL)(self, _cmd, url);
     return nil;
 }
 
@@ -320,6 +393,101 @@ static void dcl_sendEvent(id self, SEL _cmd, UIEvent *event) {
 }
 
 #pragma mark - 挂载
+
+/// 给单个类挂载。只对它「自己实现」了的方法动手（护栏在 DCLReplaceInstanceMethod 内）。
+static void dcl_hook_class(Class cls);
+
+/// 尝试给 AVPlayer 基类 + 所有已知子类挂钩子。
+/// 返回 NO 表示 AVFoundation 还没加载（连 AVPlayer 类都查不到）—— 交给延迟补挂。
+static BOOL dcl_hook_all_classes(void) {
+    Class base = NSClassFromString(@"AVPlayer");
+    if (!base) return NO;
+
+    dcl_hook_class(base);
+
+    // 抖音大概率基于 AVPlayer 做过扩展（真机已枚举到 HTSMediaMixPlayer / ISAVPlayer 等）。
+    // 逐个挂载：它们各自持有自己的原始实现，互不覆盖。
+    for (NSString *name in [DCLSystemSignal avPlayerSubclasses]) {
+        Class c = NSClassFromString(name);
+        if (c && c != base) dcl_hook_class(c);
+    }
+    return YES;
+}
+
+static void dcl_hook_class(Class cls) {
+    if (!cls || dcl_binding_for_class(cls)) return;   // 已挂过：再替换一次会形成自环
+
+    int32_t slot = g_binding_count;
+    if (slot >= DCL_MAX_PLAYER_CLASS) return;
+    DCLPlayerBinding *b = &g_bindings[slot];
+    memset(b, 0, sizeof(*b));
+    b->cls = cls;
+    const char *cn = class_getName(cls);
+    if (cn) strncpy(b->clsName, cn, sizeof(b->clsName) - 1);
+    else    strcpy(b->clsName, "(无名)");
+
+    NSUInteger before = g_hook_count;
+    // typeEncoding 一律传 NULL：沿用宿主真实编码（"v16@0:8" 这类带偏移的写法），
+    // 手写 "v@:" 会把 runtime 里的方法签名改掉，是没必要又难以察觉的风险。
+    //
+    // 关键护栏：DCLReplaceInstanceMethod 只在该类「自己实现」了方法时才动手。
+    //   子类没重写 pause → 消息本来就去父类实现（也就是我们挂在父类上的钩子），
+    //   这里会返回 NO —— 既不重复计数，也不会把继承链插出个自环来。
+    if (DCLReplaceInstanceMethod(cls, @selector(pause), NULL,
+                                 (void *)dcl_pause, &b->orig_pause)) g_hook_count++;
+    if (DCLReplaceInstanceMethod(cls, @selector(play), NULL,
+                                 (void *)dcl_play, &b->orig_play)) g_hook_count++;
+    if (DCLReplaceInstanceMethod(cls, @selector(setRate:), NULL,
+                                 (void *)dcl_setRate, &b->orig_setRate)) g_hook_count++;
+    if (DCLReplaceInstanceMethod(cls, @selector(replaceCurrentItemWithPlayerItem:), NULL,
+                                 (void *)dcl_replaceItem, &b->orig_replaceItem)) g_hook_count++;
+    if (DCLReplaceInstanceMethod(cls, @selector(initWithPlayerItem:), NULL,
+                                 (void *)dcl_initWithItem, &b->orig_initWithItem)) g_hook_count++;
+    if (DCLReplaceInstanceMethod(cls, @selector(initWithURL:), NULL,
+                                 (void *)dcl_initWithURL, &b->orig_initWithURL)) g_hook_count++;
+
+    NSUInteger got = g_hook_count - before;
+    if (got == 0) {
+        // 一个都没挂上（该类既不实现这些方法也无自有 init）—— 不占槽位，但要留痕
+        if (g_events_lock) {
+            @synchronized (g_events_lock) {
+                [g_skipped addObject:[NSString stringWithUTF8String:b->clsName]];
+            }
+        }
+        b->cls = NULL;
+        return;
+    }
+
+    // 内容先写完，再推进计数 —— 读者看到计数就一定能读到完整内容。
+    __sync_fetch_and_add(&g_binding_count, 1);
+
+    char tbuf[128];
+    snprintf(tbuf, sizeof(tbuf), "%s 挂上 %lu 个方法", b->clsName, (unsigned long)got);
+    DCLTimelineRecordC(DCLTlKindHookInstalled, (int32_t)got, tbuf);
+}
+
+// —— 延迟补挂 ——
+// dyld 构造期（本 dylib 的 constructor）AVFoundation 往往还没被加载，
+// NSClassFromString(@"AVPlayer") 会返回 Nil —— 那一刻一个钩子都挂不上，
+// 表现出来的症状正是「视频明明停了，探针却一条都没抓到」。
+// 有限次重试：既要把迟到的类补上，也不能无限轮询拖着进程不放。
+static const int kRetryDelays[] = {1, 2, 5, 10, 20};   // 秒
+
+static void dcl_schedule_retry(int attempt) {
+    int n = (int)(sizeof(kRetryDelays) / sizeof(kRetryDelays[0]));
+    if (attempt >= n) {
+        if (NSClassFromString(@"AVPlayer") == Nil) {
+            DCLTimelineRecordC(DCLTlKindHookInstalled, -1,
+                               "AVPlayer 类始终未加载，播放钩子放弃挂载");
+        }
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)kRetryDelays[attempt] * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        @try { (void)dcl_hook_all_classes(); } @catch (id e) { (void)e; }
+        dcl_schedule_retry(attempt + 1);
+    });
+}
 
 @implementation DCLPlaybackTracer
 
@@ -340,25 +508,16 @@ static void dcl_sendEvent(id self, SEL _cmd, UIEvent *event) {
     @try {
         g_events = [NSMutableArray array];
         g_events_lock = [NSObject new];
+        g_skipped = [NSMutableArray array];
         g_symbolQueue = dispatch_queue_create("com.dcl.symbolicate", DISPATCH_QUEUE_SERIAL);
 
-        // AVFoundation 层：AVPlayer 是所有视频播放的汇聚点，继承自它的自研播放器自动被覆盖
-        Class playerCls = NSClassFromString(@"AVPlayer");
-        if (playerCls) {
-            // typeEncoding 一律传 NULL：沿用宿主的真实编码（"v16@0:8" 这类带偏移的写法），
-            // 手写 "v@:" 会把 runtime 里的方法签名改掉，是没必要又难以察觉的风险。
-            if (DCLReplaceInstanceMethod(playerCls, @selector(pause), NULL, (void *)dcl_pause, (void **)&dcl_orig_pause_fn)) g_hook_count++;
-            if (DCLReplaceInstanceMethod(playerCls, @selector(play), NULL, (void *)dcl_play, (void **)&dcl_orig_play_fn)) g_hook_count++;
-            if (DCLReplaceInstanceMethod(playerCls, @selector(setRate:), NULL, (void *)dcl_setRate, (void **)&dcl_orig_setRate_fn)) g_hook_count++;
-            if (DCLReplaceInstanceMethod(playerCls, @selector(replaceCurrentItemWithPlayerItem:),
-                             NULL, (void *)dcl_replaceItem, (void **)&dcl_orig_replaceItem_fn)) g_hook_count++;
-
-            // 实例化探针（坐实是否走系统播放器，见上方说明）
-            if (DCLReplaceInstanceMethod(playerCls, @selector(initWithPlayerItem:), NULL,
-                             (void *)dcl_initWithItem, (void **)&dcl_orig_initWithItem_fn)) g_hook_count++;
-            if (DCLReplaceInstanceMethod(playerCls, @selector(initWithURL:), NULL,
-                             (void *)dcl_initWithURL, (void **)&dcl_orig_initWithURL_fn)) g_hook_count++;
+        // 播放钩子：AVPlayer 基类 + 所有子类各挂一份，各自持有原始实现。
+        // 首次尝试 + 若干次延迟补挂（应对 AVFoundation 迟加载）。
+        if (!dcl_hook_all_classes()) {
+            DCLTimelineRecordC(DCLTlKindHookInstalled, 0,
+                               "首次挂载时 AVPlayer 尚未加载，转入延迟补挂");
         }
+        dcl_schedule_retry(0);
 
         // 触摸入口：唯一的额外动作就是打个时间戳。
         // 挂载层同样要从「当前 App 实例」向上找真正实现 sendEvent: 的那一层 ——
@@ -387,5 +546,22 @@ static void dcl_sendEvent(id self, SEL _cmd, UIEvent *event) {
 }
 
 + (NSUInteger)hookedCount { return g_hook_count; }
+
++ (NSArray<NSString *> *)hookedPlayerClasses {
+    NSMutableArray *a = [NSMutableArray array];
+    int32_t n = g_binding_count;
+    for (int32_t i = 0; i < n; i++) {
+        if (!g_bindings[i].cls) continue;
+        [a addObject:[NSString stringWithUTF8String:g_bindings[i].clsName]];
+    }
+    return a;
+}
+
++ (NSArray<NSString *> *)skippedPlayerClasses {
+    if (!g_events_lock) return @[];
+    @synchronized (g_events_lock) {
+        return [g_skipped copy] ?: @[];
+    }
+}
 
 @end

@@ -37,6 +37,10 @@ typedef NS_ENUM(NSUInteger, DCLPauseSource) {
 @interface DCLPauseEvent : NSObject
 @property (nonatomic) NSTimeInterval unixTime;
 @property (nonatomic, copy) NSString *action;        // pause / play / setRate: / replaceItem
+/// 命中这次调用的**真实类名**（如 HTSMediaMixPlayer）。
+/// 光知道「AVPlayer 被 pause」没用 —— 抖音若用重写过的子类，
+/// 必须说清是哪一层发起的，归因才有指向性。
+@property (nonatomic, copy) NSString *playerClass;
 @property (nonatomic) float  rateBefore;
 @property (nonatomic) float  rateAfter;
 @property (nonatomic) BOOL   onMainThread;
@@ -58,6 +62,18 @@ typedef NS_ENUM(NSUInteger, DCLPauseSource) {
 
 /// 已成功挂载的探针方法数（健康自检用：>0 说明探针在工作）
 + (NSUInteger)hookedCount;
+
+/// 实际挂上钩子的播放器类名（如 HTSMediaMixPlayer、AVPlayer）。
+///
+/// 这一项直接回答「钩子到底蹲在哪几层」：
+///   只看到 AVPlayer          → 只覆盖基类，抖音若用重写 pause 的子类就蹲不到人
+///   看到 AVPlayer + 若干子类 → 各层都蹲上了，漏抓才真能算到 probes 头上
+/// 健康自检与 latest.log 都会输出它 —— 取证结论必须能被独立验证，不能靠猜。
++ (NSArray<NSString *> *)hookedPlayerClasses;
+
+/// AVPlayer 子类里，钩子尝试过但没能挂上的类名（多为「子类未自己实现该方法」）。
+/// 留个出口：万一抖音换了类名导致漏挂，日志里能直接看到，而不是沉默地少抓一条。
++ (NSArray<NSString *> *)skippedPlayerClasses;
 
 @end
 

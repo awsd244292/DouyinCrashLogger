@@ -121,6 +121,7 @@ static NSString *dcl_tl_kind_name(uint32_t kind) {
         case DCLTlKindMemoryWarning:    return @"内存警告";
         case DCLTlKindCrash:            return @"崩溃";
         case DCLTlKindSnapshot:         return @"生成快照";
+        case DCLTlKindHookInstalled:    return @"钩子挂载";
     }
     return [NSString stringWithFormat:@"类型%u", (unsigned)kind];
 }
