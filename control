@@ -1,6 +1,6 @@
 Package: com.douyincrashlogger.tweak
 Name: DouyinCrashLogger
-Version: 1.4-2
+Version: 1.4-3
 Architecture: iphoneos-arm
 Description: 记录抖音 App 崩溃日志（信号/OC异常捕获 + 摇一摇导出），仅供学习交流。
 Maintainer: DouyinCrashLogger
