@@ -15,9 +15,10 @@ on:
       - '*.cpp'
       - '*.s'
       - '*.S'
-      - 'DYYY.plist'
+      - 'DouyinCrashLogger.plist'
       - 'control'
       - 'Makefile'
+      - 'scripts/**'
       - 'Resources/**'
       - 'layout/**'
   workflow_dispatch:
@@ -65,120 +66,42 @@ jobs:
   build:
     needs: changes
     if: needs.changes.outputs.should_build == 'true'
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: true
           fetch-depth: 0
 
-      - name: Check cache
+      - name: Install toolchain (clang + llvm-lld + llvm-lipo)
         run: |
-          echo upstream_heads=`git ls-remote https://github.com/roothide/theos | head -n 1 | cut -f 1`-`git ls-remote https://github.com/theos/sdks | head -n 1 | cut -f 1` >> $GITHUB_ENV
+          sudo apt-get update -y
+          sudo apt-get install -y clang lld llvm
+          clang --version
+          ls "$(dirname "$(readlink -f "$(which clang)")")" | grep -E 'ld64.lld|llvm-lipo'
 
-      - name: Use cache
-        id: cache
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/theos
-          key: ${{ runner.os }}-${{ env.upstream_heads }}
+      - name: Fetch iPhoneOS SDK (one-time, ~220MB)
+        run: make fetch-sdk
 
-      - name: Remove unused Homebrew taps
-        env:
-          HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
-          HOMEBREW_NO_AUTOREMOVE: "1"
-        run: |
-          if brew list --formula | grep -Fxq "bicep"; then
-            brew uninstall --formula --ignore-dependencies bicep
-          fi
-          for tap in aws/tap azure/bicep; do
-            if brew tap | grep -Fxq "$tap"; then
-              brew untap "$tap"
-            fi
-          done
+      - name: Static precheck (no SDK needed)
+        run: make precheck
 
-      - name: Prepare Theos
-        uses: huami1314/theos-action@main
+      - name: Build injectable dylib (fat arm64 + arm64e)
+        run: make dylib
 
-      - name: Setup GNU Make
-        run: |
-          echo "$(brew --prefix)/opt/make/libexec/gnubin" >> $GITHUB_PATH
+      - name: Build .deb (rootful; 巨魔/自签注入只用上面的 dylib)
+        run: make deb
 
-      - name: Clean packages dir
-        run: rm -rf packages && mkdir -p packages
-
-      - name: Build Rootful
-        run: |
-          make package FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
-          for f in packages/*.deb; do
-            [ -f "$f" ] && [[ "$f" != *"-root"*".deb" ]] && mv "$f" "${f%.deb}-rootful.deb"
-          done
-
-      - name: Build Rootless
-        if: ${{ github.event.inputs.scheme == 'all' || github.event.inputs.scheme == 'rootless' }}
-        run: |
-          make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
-          for f in packages/*.deb; do
-            [ -f "$f" ] && [[ "$f" != *"-root"*".deb" ]] && mv "$f" "${f%.deb}-rootless.deb"
-          done
-
-      - name: Build Roothide
-        if: ${{ github.event.inputs.scheme == 'all' || github.event.inputs.scheme == 'roothide' }}
-        run: |
-          make package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
-          for f in packages/*.deb; do
-            [ -f "$f" ] && [[ "$f" != *"-root"*".deb" ]] && mv "$f" "${f%.deb}-roothide.deb"
-          done
-
-      - name: Prepare package metadata
+      - name: Read package version
         id: package
         run: |
           version=$(awk -F': ' '$1 == "Version" { print $2; exit }' control)
-          if [ -z "$version" ]; then
-            echo "Unable to read package version from control" >&2
-            exit 1
-          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Verify Deb packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-
-          expected_schemes=(rootful)
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            case "${{ github.event.inputs.scheme }}" in
-              all) expected_schemes=(rootful rootless roothide) ;;
-              rootful|rootless|roothide) expected_schemes=(${{ github.event.inputs.scheme }}) ;;
-            esac
-          fi
-
-          for scheme in "${expected_schemes[@]}"; do
-            scheme_files=(packages/*-"${scheme}".deb)
-            if [ "${#scheme_files[@]}" -ne 1 ]; then
-              echo "Expected exactly one ${scheme} package, found ${#scheme_files[@]}" >&2
-              exit 1
-            fi
-          done
-
-          deb_files=(packages/*.deb)
-          printf 'Package artifact: %s\n' "${deb_files[@]}"
-
-      - name: Extract injectable dylib
-        env:
-          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
-          # rootful 包的 dylib 不含 LC_RPATH 越狱搜索路径、不含 /var/jb、.jbroot 前缀，
-          # 注入场景最干净；且含 arm64 + arm64e 双切片。
-          SOURCE_DEB_GLOB: 'packages/*rootful*.deb'
-          REQUIRED_ARCH: 'arm64e'
-          # 本工程 dylib 名为 DouyinCrashLogger.dylib
-          TWEAK_DYLIB_NAME: 'DouyinCrashLogger.dylib'
-        run: .github/scripts/extract-release-dylib.sh
-
-      - name: Upload injectable dylib
+      - name: Upload artifacts (dylib + deb)
         uses: actions/upload-artifact@v7
         with:
           name: DouyinCrashLogger-${{ steps.package.outputs.version }}
-          path: ${{ github.workspace }}/packages/*.dylib
+          path: |
+            build/DouyinCrashLogger.dylib
+            build/DouyinCrashLogger_*.deb

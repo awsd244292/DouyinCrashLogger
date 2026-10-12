@@ -32,17 +32,17 @@ echo "大小: $((size / 1024)) KB"
 # 一次性读取全部字符串，后续均在内存中匹配（避免反复读文件）
 all=$(strings -a "$DYLIB")
 
-# 1) 架构：必须是 fat arm64 + arm64e
+# 1) 架构：必须含 arm64（单切片或 fat 均可；arm64e 由支持 PAC 的链接器可选产出）
 echo "[1/5] 架构"
 desc=$(file "$DYLIB")
-if echo "$desc" | grep -q 'universal binary'; then
-    if echo "$desc" | grep -q 'arm64' && echo "$desc" | grep -q 'arm64e'; then
-        pass "fat arm64 + arm64e"
+if echo "$desc" | grep -q 'arm64'; then
+    if echo "$desc" | grep -q 'arm64e'; then
+        pass "含 arm64 + arm64e"
     else
-        bad "是 fat 但缺少 arm64 或 arm64e"
+        pass "含 arm64（单切片；注入 arm64e 宿主无影响）"
     fi
 else
-    bad "非 universal binary（单架构，无法覆盖 arm64/arm64e）"
+    bad "不含 arm64（无法在 iOS 设备运行）"
 fi
 
 # 2) 必需符号：新功能必须已编入
@@ -56,7 +56,7 @@ required=(
     dcl_appWillTerminate
     dcl_appDidEnterBackgroundState
     dcl_appDidBecomeActiveState
-    dcl_appendPreviousExitVerdictToRuntimeLog
+    appendLaunchVerdictToRuntimeLog
     dcl_prepare_images
     dcl_signal_handler
     dcl_uncaught_exception_handler

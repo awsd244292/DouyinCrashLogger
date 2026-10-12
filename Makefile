@@ -1,60 +1,115 @@
-# DouyinCrashLogger — 抖音崩溃记录 Tweak
-# 产物：DYYY-style 干净 dylib，可用 TrollFools / insert_dylib / Sideloadly 注入抖音，
-# 不依赖 mobilesubstrate（纯 Objective-C runtime 方法交换 + POSIX 信号捕获）。
-
-TARGET := iphone:clang:latest:15.0
-ARCHS := arm64 arm64e
-
-TWEAK_NAME := DouyinCrashLogger
-
-# 保留符号表：便于崩溃日志里回溯到插件自身的函数名（自用调试更友好）。
-# Theos 默认会 strip，置 STRIP 为 echo 使其变成空操作。
-STRIP = echo
-
-# 源文件：不使用 Logos %hook（避免引入 substrate 依赖），全部用原生 runtime 交换 + C 信号捕获
-# 极简版：已移除 UI 层（DCLCrashLogViewer），只保留崩溃捕获 + 日志落盘。
-# 新增三大旁路观测模块：
-#   DCLWatchdog.m        —— 主线程卡死看门狗 + Mach 栈取证
-#   DCLPlaybackTracer.m  —— 视频暂停归因探针（hook AVPlayer / UIApplication.sendEvent:）
-#   DCLHealthCheck.m     —— 触发式健康自检（证明插件自身在工作）
-#   DCLConfig.m          —— 两档采集方案开关（A 零 hook / B hook 全开），决定后两者装不装
-#   DCLHotSwitch.m       —— 摇一摇热切换（始终安装，独立于档位，免文件免重启）
-#   DCLLogger.m          —— 日志管家：按会话轮转、大小闸门、噪音折叠、ASCII 净化、stderr 接管
-#   DCLSupport.m         —— 公共底层工具（微秒时钟 / 类自有方法判定 / 安全方法替换 / ASCII 净化）
-DouyinCrashLogger_FILES := DCLMain.m DCLConstants.m DCLCrashReporter.m DCLWatchdog.m DCLPlaybackTracer.m DCLHealthCheck.m DCLConfig.m DCLHotSwitch.m DCLLogger.m DCLSupport.m
-
-DouyinCrashLogger_CFLAGS := -fobjc-arc -O0 -Wno-deprecated-declarations
-DouyinCrashLogger_LDFLAGS :=
-
-include $(THEOS)/makefiles/common.mk
-
-# 仅依赖系统框架，不链接 substrate
-# AVFoundation：DCLPlaybackTracer 通过运行时 hook AVPlayer，需其头文件；
-# 实际符号全部经 ObjC runtime / NSClassFromString 解析，不引入链接依赖（-undefined dynamic_lookup 兜底）。
-# AudioToolbox：热切换的震动反馈用到 AudioServicesPlaySystemSound。
-# 注意：FRAMEWORKS 同名变量重复赋值后者覆盖前者，故全部依赖框架统一在此一处声明。
-DouyinCrashLogger_FRAMEWORKS := UIKit Foundation AVFoundation AudioToolbox
-# 关键：不定义 LIBRARIES，避免 -lsubstrate；tweak.mk 的 -undefined dynamic_lookup 即可，
-# 由于我们从不引用任何 substrate 符号，dyld 在纯自签环境下也能正常加载。
-
-include $(THEOS_MAKE_PATH)/tweak.mk
-
-# ---------------------------------------------------------------------------
-# 构建前静态自检（纯 Python / Shell，不依赖 Theos 与 iOS SDK，任何机器都能跑）
+# DouyinCrashLogger — 纯 clang 交叉编译（无需 Theos / 无需 macOS）
 #
-# 为什么需要：本项目是「先实现、后构建」的流程，编译错误要等到真机构建才暴露，
-# 白白多花一轮。以下两项针对的是静态评审最容易漏、而编译器必报的问题：
+# 思路（对齐 PerfDebugPlugin 的本地真机级构建）：
+#   - clang 18 直接交叉编译到 arm64-apple-ios
+#   - ld64.lld 负责 Mach-O 链接（-undefined dynamic_lookup 兜底，不依赖任何注入框架）
+#   - 本地秒级编译、CI 也省掉装 Theos 的步骤，整体更快更轻
 #
-#   1) scan_self_in_cfunc.py
-#      static C 函数体内误用 [self ...]。ObjC 的 self 只在方法里隐式存在，
-#      C 函数里写它会直接编译失败（本项目已在 dcl_watchdog_main 上踩过一次）。
-#   2) test_capture_mode_parse.py
-#      采集方案开关解析回归。默认开关文件的注释里写满了 "full = B 方案" 字样，
-#      一旦注释过滤失效，默认档就会被误读成 hook 全开 —— 零 hook 的默认保证失效。
+# 关于架构：当前链接器 ld64.lld（LLVM 的 Mach-O 后端）对 arm64e / 指针认证(PAC)
+# 支持不全，arm64e 目标会被静默降级成 arm64，故只产出 **arm64 单切片**。
+# 注入到 arm64e 宿主 App 完全没问题（dyld 支持混合加载），功能不受影响。
+# 等将来有支持 PAC 的链接器时，把下面 ARCHS 改回 "arm64 arm64e" 即可恢复双切片。
 #
-# 用法：make precheck
-# ---------------------------------------------------------------------------
+# 首次： make fetch-sdk   （一次性稀疏拉取 iPhoneOS SDK，约 220MB，放 ~/.pdp-sdks）
+# 日常： make dylib        （产出 build/DouyinCrashLogger.dylib，arm64）
+#        make deb          （打包 .deb，供越狱；巨魔/自签注入只用 dylib）
+#        make precheck     （静态自检，无需 SDK）
+#        make verify       （对已有 dylib 跑交付前静态自检）
+#        make clean
+
+# ---- 工具链（clang 18 + llvm-lld 的 Mach-O 链接器 ld64.lld）--------------
+CLANG      ?= clang
+LLVM_BIN   := $(dir $(realpath $(shell which clang)))
+LD64_LLD   := $(LLVM_BIN)ld64.lld
+DPKG_DEB   ?= dpkg-deb
+
+# ---- SDK ----------------------------------------------------------------
+# SDK 只在真正编译/打包时需要；precheck / fetch-sdk / clean 不需要，
+# 不要把 SDK 缺失的报错挡在所有目标前面。
+SDKROOT ?= $(HOME)/.pdp-sdks/iPhoneOS14.5.sdk
+NEED_SDK :=
+ifneq ($(filter dylib deb,$(MAKECMDGOALS)),)
+NEED_SDK := 1
+endif
+ifeq ($(MAKECMDGOALS),)
+NEED_SDK := 1
+endif
+ifeq ($(NEED_SDK),1)
+ifeq ($(wildcard $(SDKROOT)),)
+$(error SDK 不存在：$(SDKROOT)；请先执行 `make fetch-sdk` 拉取 iPhoneOS SDK)
+endif
+endif
+
+# ---- 目标参数 ------------------------------------------------------------
+MIN_IOS   := 14.0
+ARCHS     := arm64
+TWEAK     := DouyinCrashLogger
+VERSION   := $(shell grep -E '^Version:' control | head -1 | cut -d' ' -f2)
+PKG_VER   := $(subst .,_,$(VERSION))
+
+# ---- 源文件 --------------------------------------------------------------
+FILES := DCLMain.m DCLConstants.m DCLCrashReporter.m DCLWatchdog.m DCLPlaybackTracer.m \
+         DCLHealthCheck.m DCLConfig.m DCLHotSwitch.m DCLLogger.m DCLSupport.m
+
+CFLAGS := -fobjc-arc -O0 -Wno-deprecated-declarations -fno-objc-msgsend-selector-stubs
+SYSROOT_FLAGS := -isysroot $(SDKROOT)
+FRAMEWORK_DIRS := $(SDKROOT)/System/Library/Frameworks $(SDKROOT)/System/Library/PrivateFrameworks
+FW_FLAGS := $(foreach d,$(FRAMEWORK_DIRS),-F$(d))
+
+# ---- 产物路径 ------------------------------------------------------------
+BUILD := build
+OBJ   := $(BUILD)/obj
+OBJS  := $(addprefix $(OBJ)/arm64/,$(FILES:.m=.o))
+FAT   := $(BUILD)/$(TWEAK).dylib
+
+.PHONY: all dylib deb precheck fetch-sdk clean verify
+
+all: dylib
+
+# 编译（每个源文件一个 .o）
+$(OBJ)/arm64/%.o: %.m
+	@mkdir -p $(dir $@)
+	$(CLANG) -target arm64-apple-ios$(MIN_IOS) $(SYSROOT_FLAGS) $(FW_FLAGS) $(CFLAGS) -c $< -o $@
+
+# 链接动态库：
+#   -nostdlib            不默认链 libSystem（配合 -undefined dynamic_lookup，全部符号运行时解析）
+#   -undefined dynamic_lookup  任何未定义符号都留给 dyld 在加载时解析，不依赖 substrate/UIKit 等宿主框架
+#   -Wl,-platform_version / -Wl,-arch  显式补齐 ld64.lld 在自定义 -fuse-ld 下不自动下发的 Darwin 参数
+$(FAT): $(OBJS)
+	$(CLANG) -target arm64-apple-ios$(MIN_IOS) -isysroot $(SDKROOT) \
+	  -fuse-ld=$(LD64_LLD) -dynamiclib -nostdlib -undefined dynamic_lookup \
+	  -Wl,-platform_version,ios,$(MIN_IOS),$(MIN_IOS) -Wl,-arch,arm64 \
+	  -install_name @rpath/$(TWEAK).dylib \
+	  -o $@ $^
+	@echo "==> $@ ($(shell file $@ | cut -d: -f2-))"
+
+dylib: $(FAT)
+	@$(MAKE) -s verify
+
+# 交付前静态自检（符号 / 架构 / 依赖白名单）；对已有 dylib 跑，不依赖 SDK
+verify:
+	@DYLIB=$(FAT); [ -f "$$DYLIB" ] || { echo "未找到 $FAT，请先 make dylib"; exit 1; }; \
+	 bash scripts/verify-dylib.sh $$DYLIB
+
+# 打包 .deb（越狱用；巨魔/自签注入只用上面的 dylib）
+deb: dylib
+	@rm -rf $(BUILD)/pkg
+	@mkdir -p $(BUILD)/pkg/DEBIAN
+	@mkdir -p $(BUILD)/pkg/Library/MobileSubstrate/DynamicLibraries
+	@cp $(FAT) $(BUILD)/pkg/Library/MobileSubstrate/DynamicLibraries/$(TWEAK).dylib
+	@cp $(TWEAK).plist $(BUILD)/pkg/Library/MobileSubstrate/DynamicLibraries/$(TWEAK).plist
+	@cp control $(BUILD)/pkg/DEBIAN/control
+	@$(DPKG_DEB) --build -Zgzip $(BUILD)/pkg $(BUILD)/$(TWEAK)_$(PKG_VER).deb >/dev/null
+	@echo "==> $(BUILD)/$(TWEAK)_$(PKG_VER).deb"
+
+# 构建前静态自检（无需 SDK）
 precheck:
 	@python3 scripts/scan_self_in_cfunc.py
 	@python3 scripts/test_capture_mode_parse.py
 	@bash -n scripts/verify-dylib.sh && echo "[3/3] verify-dylib.sh 语法 OK"
+
+fetch-sdk:
+	@bash scripts/fetch-sdk.sh
+
+clean:
+	rm -rf $(BUILD)

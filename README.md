@@ -133,15 +133,24 @@
 
 ## 构建
 
-仓库自带 `.github/workflows/build.yml`，在 GitHub 云端 macOS runner 上用 `theos-action`
-自动装 Theos + iOS SDK 编译，默认只产出**单一 `DouyinCrashLogger.dylib`**
-（rootful 包提取，零越狱路径残留；如需 `.deb` 可在 Run workflow 时把 scheme 选成 `all`）。
+纯 clang 交叉编译（**无需 Theos、无需 macOS**），CI 在 ubuntu runner 上装好 `clang + lld + llvm`
+后直接编译，整体比 Theos 流程更快更轻。
 
-本地 macOS 构建（需 Theos）：
+**首次**（一次性拉取 iPhoneOS SDK，约 220MB，放 `~/.pdp-sdks`）：
 ```bash
-make package FINALPACKAGE=1
-# 产物在 packages/ 下
+make fetch-sdk
 ```
+
+**日常**：
+```bash
+make dylib        # 产出 build/DouyinCrashLogger.dylib（fat arm64 + arm64e）
+make deb          # 打包 build/DouyinCrashLogger_<版本>.deb（越狱用；巨魔/自签注入只用 dylib）
+make precheck     # 静态自检（符号/解析回归），无需 SDK
+make verify       # 对已有 dylib 跑交付前静态自检
+```
+
+仓库自带 `.github/workflows/build.yml`：push 到 `main` 或手动触发即自动产出
+**单一 `DouyinCrashLogger.dylib` + `.deb`** 并上传为 Action Artifact，零越狱路径残留。
 
 ---
 
