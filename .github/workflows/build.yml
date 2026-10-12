@@ -19,6 +19,7 @@ on:
       - 'control'
       - 'Makefile'
       - 'scripts/**'
+      - 'tools/**'
       - 'Resources/**'
       - 'layout/**'
   workflow_dispatch:
