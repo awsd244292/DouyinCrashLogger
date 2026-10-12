@@ -146,3 +146,23 @@ python3 "$ROOT/tools/verify_dylib.py" "$OUT" --install-name "@rpath/$TWEAK.dylib
 echo
 echo "✅ 产物：$OUT"
 file "$OUT"
+
+# ---------------------------------------------------------------------------
+# 6. 带版本号的交付副本
+# ---------------------------------------------------------------------------
+# 为什么需要这一份：真正拿去自签注入的就是这个 dylib，也是换得最勤的那个。
+# 光秃秃一个 DouyinCrashLogger.dylib 分不清是哪一版 —— 装到手机上过两天就忘了，
+# 出问题时连「装的到底是哪个版本」都要回头翻记录。deb 一直带版本号，
+# 反而是最常用的这个文件没有，属于本末倒置。
+#
+# 只复制文件名，不改 install_name：
+#   注入走的是文件路径（DYLD_INSERT_LIBRARIES / 自签注入），
+#   install_name 是库自己声称的身份，影响的是「别的二进制链接它时去哪找」，
+#   对注入本身没有作用；而 verify 校验的 install_name 与原产物一致，不能动。
+# 因此这一份与 $OUT 内容逐字节相同，无需重复自检。
+PKG_VER="$(grep -E '^Version:' "$ROOT/control" | head -1 | cut -d' ' -f2)"
+if [ -n "$PKG_VER" ]; then
+    VERSIONED_OUT="$(dirname "$OUT")/${TWEAK}_${PKG_VER//./_}.dylib"
+    cp "$OUT" "$VERSIONED_OUT"
+    echo "✅ 交付副本（带版本号，自签注入用这份）：$VERSIONED_OUT"
+fi

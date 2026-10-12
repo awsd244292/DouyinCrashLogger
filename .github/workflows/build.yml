@@ -100,6 +100,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: DouyinCrashLogger-${{ steps.package.outputs.version }}
+          # 只上传带版本号的 dylib：不带版本号的 build/DouyinCrashLogger.dylib
+          # 不含下划线，匹配不到这里的 *_*.dylib，不会重复上传一份。
           path: |
-            build/DouyinCrashLogger.dylib
+            build/DouyinCrashLogger_*.dylib
             build/DouyinCrashLogger_*.deb
