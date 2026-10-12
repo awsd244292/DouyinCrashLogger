@@ -56,6 +56,12 @@ typedef NS_ENUM(NSInteger, DCLPreviousExitKind) {
 /// 在下一轮启动时综合判定真实退出性质（见 DCLPreviousExitKind）。
 + (void)recordExitMarkAndRegisterTerminateObserver;
 
+/// 把上次退出性质的结论（英文）写入 plugin_runtime.log。
+/// 必须在 App 沙盒就绪、runloop 启动后调用（2s 延迟主线程块），绝不在 dyld
+/// constructor 阶段调用——那时 NSHomeDirectory 未必指向正确沙盒且 GCD 异步块
+/// 可能尚未被调度，写入会落空。详见 DCLMain.m 的时序注释。
++ (void)appendLaunchVerdictToRuntimeLog;
+
 /// 延迟块中调用：把 stderr 重定向到沙盒 runtime 日志（plugin_runtime.log），
 /// 即使随后被 SIGKILL，被杀前已落盘的 stderr 也可作为排查线索（末尾可能丢失）。
 + (void)redirectStderrToRuntimeLog;

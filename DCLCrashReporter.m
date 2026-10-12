@@ -30,7 +30,7 @@
 
 /// 内部方法（不对外暴露）
 @interface DCLCrashReporter (DCLPrivate)
-+ (void)dcl_appendPreviousExitVerdictToRuntimeLog;
++ (void)appendLaunchVerdictToRuntimeLog;
 + (void)dcl_appDidEnterBackgroundState:(NSNotification *)note;
 + (void)dcl_appDidBecomeActiveState:(NSNotification *)note;
 @end
@@ -636,8 +636,6 @@ static void dcl_prepare_meta(void) {
                    name:UIApplicationDidBecomeActiveNotification
                  object:nil];
 
-        // 把「上次退出状态」追加写入 plugin_runtime.log
-        [self dcl_appendPreviousExitVerdictToRuntimeLog];
     } @catch (id e) {
         (void)e;
     }
@@ -649,7 +647,7 @@ static void dcl_prepare_meta(void) {
 /// 宿主吐出来的，编码混乱；再混进去 UTF-8 中文，第三方工具一打开就是满屏
 /// 「ä¸­æ–‡」式的乱码。DCLLogger 会把任何非 ASCII 字节转成 \xNN，
 /// 与其让它把所有中文都转义成一串不可读的东西，不如给出英文原文。
-+ (void)dcl_appendPreviousExitVerdictToRuntimeLog {
++ (void)appendLaunchVerdictToRuntimeLog {
     @try {
         [DCLLogger appendRuntimeLine:@"----- [DCL] launch -----"];
         [DCLLogger appendRuntimeLine:

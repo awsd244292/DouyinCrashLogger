@@ -84,6 +84,10 @@ __attribute__((constructor)) static void dcl_entry(void) {
                 [DCLPlaybackTracer install];
             }
 
+            // 启动标记 / 上次退出性质：必须在沙盒就绪、runloop 启动后才写 runtime 日志，
+            // 否则 constructor 阶段 NSHomeDirectory 未就位 / GCD 异步块未调度 → 写入落空。
+            [DCLCrashReporter appendLaunchVerdictToRuntimeLog];
+
             [DCLCrashReporter redirectStderrToRuntimeLog];
             [DCLCrashReporter writeLatestLogWithReason:@"启动完成（自动）"];
         } @catch (id e) {
