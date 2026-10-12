@@ -187,6 +187,10 @@ static DCLCaptureProfile dcl_read_profile(void) {
     [a addObject:@"上次退出性质判定（区分主动划掉 / 后台回收 / 真闪退）"];
     [a addObject:@"主线程卡死时长检测（CFRunLoopObserver 公开 API，非 hook）"];
     [a addObject:@"插件健康自检（证明「插件在工作」本身）"];
+    // 这两项零 hook —— 系统层信号是「自研播放器钩不到」时的兜底证据，
+    // 统一时间线只是把已有事件排在同一条轴上，没有理由因为档位降级而放弃。
+    [a addObject:@"系统层暂停硬信号（音频中断/路由变更/前后台/锁屏/内存警告，零 hook）"];
+    [a addObject:@"统一时间线（所有事件共用 mach_absolute_time，可对齐因果）"];
     if ([self captureProfile] == DCLCaptureProfileFull) {
         [a addObject:@"视频暂停/播放的发起者调用栈（旁路 hook，原样透传）"];
         [a addObject:@"触摸时间线（暂停是否紧随触摸发生）"];

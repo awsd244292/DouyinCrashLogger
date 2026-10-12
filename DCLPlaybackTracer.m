@@ -6,11 +6,13 @@
 #import "DCLPlaybackTracer.h"
 #import "DCLWatchdog.h"
 #import "DCLSupport.h"   // DCLNowUs / DCLReplaceInstanceMethod —— 不再各模块自己抄一份
+#import "DCLTimeline.h"  // 所有探针共用同一条时间线 —— 事件必须能在同一条轴上比对
 
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
+#import <stdio.h>        // snprintf（时间线打点用）
 #import <execinfo.h>
 #import <mach-o/dyld.h>   // _dyld_image_count / _dyld_get_image_name
 #import <string.h>
@@ -233,6 +235,17 @@ static inline void dcl_capture(id player, NSString *action, float before, float 
     }
 
     if (allow) {
+        // 时间线打点必须排在 backtrace 之前：它是定长写入、微秒级、零分配，
+        // 而回溯是钩子体里唯一的重活。即便后续环节出问题，这条时间点也已经落地，
+        // 「什么时候发生的」不会因为「归因失败」而一起丢掉。
+        DCLTimelineEventKind k = DCLTlKindPauseHook;
+        if ([action isEqualToString:@"play"]) k = DCLTlKindPlayHook;
+        else if ([action hasPrefix:@"replaceCurrentItem"]) k = DCLTlKindItemReplace;
+        char tbuf[96];
+        snprintf(tbuf, sizeof(tbuf), "%s rate=%.2f %s",
+                 action.UTF8String, (double)after, [NSThread isMainThread] ? "主线程" : "子线程");
+        DCLTimelineRecordC(k, (int32_t)(after * 100.0f), tbuf);
+
         // 栈上缓冲：绝不能用 static —— AVPlayer 的回调常在非主线程并发触发，
         // 静态缓冲会被多个线程同时写，采出来的栈是几路调用混在一起的假栈，
         // 基于它做的归因会指向完全错误的方向。
@@ -271,11 +284,38 @@ static void dcl_replaceItem(id self, SEL _cmd, AVPlayerItem *item) {
     if (dcl_orig_replaceItem_fn) dcl_orig_replaceItem_fn(self, _cmd, item);
 }
 
+#pragma mark - AVPlayer 实例化探针（坐实「抖音走不走系统播放器」）
+
+// 这一组钩子不参与归因，只回答一个是非题：
+//   本会话到底有没有 AVPlayer 实例被创建出来？
+// 刷完整一轮视频后看时间线里有没有「AVPlayer实例」这一行 ——
+//   有  → 主播放确实走系统播放器，pause 钩子没命中就该从别处找原因；
+//   没有 → 高度怀疑自研引擎，钩子命中不了是「蹲错楼层」而非「钩子写漏」，
+//          别再往 AVPlayer 上加钩子了，加多少都是零。
+// 相比纯经验判断「抖音大概不用 AVPlayer」，这给了个可验证的事实。
+
+static id (*dcl_orig_initWithItem_fn)(id, SEL, id) = NULL;
+static id dcl_initWithItem(id self, SEL _cmd, AVPlayerItem *item) {
+    DCLTimelineRecordC(DCLTlKindAVPlayerSeen, 1, "initWithPlayerItem: 被创建");
+    if (dcl_orig_initWithItem_fn) return dcl_orig_initWithItem_fn(self, _cmd, item);
+    return nil;
+}
+
+static id (*dcl_orig_initWithURL_fn)(id, SEL, id) = NULL;
+static id dcl_initWithURL(id self, SEL _cmd, NSURL *url) {
+    DCLTimelineRecordC(DCLTlKindAVPlayerSeen, 2, "initWithURL: 被创建");
+    if (dcl_orig_initWithURL_fn) return dcl_orig_initWithURL_fn(self, _cmd, url);
+    return nil;
+}
+
 /// UIApplication sendEvent: —— 只做一件事：记录触摸时刻。
 /// 事件对象无条件转发给原始实现，连返回值都不改。
 static void (*dcl_orig_sendEvent_fn)(id, SEL, id) = NULL;
 static void dcl_sendEvent(id self, SEL _cmd, UIEvent *event) {
     [DCLWatchdog noteTouch];
+    // 触摸时间线：单独一条记录，用于在时间线上判定「暂停紧随触摸发生 = 用户主动」。
+    // 事件类型写进 aux，方便区分是按下还是抬起（暂停多由抬起触发）。
+    DCLTimelineRecordC(DCLTlKindTouch, (int32_t)(event ? (int)event.type : -1), "UIEvent 分发");
     if (dcl_orig_sendEvent_fn) dcl_orig_sendEvent_fn(self, _cmd, event);
 }
 
@@ -312,6 +352,12 @@ static void dcl_sendEvent(id self, SEL _cmd, UIEvent *event) {
             if (DCLReplaceInstanceMethod(playerCls, @selector(setRate:), NULL, (void *)dcl_setRate, (void **)&dcl_orig_setRate_fn)) g_hook_count++;
             if (DCLReplaceInstanceMethod(playerCls, @selector(replaceCurrentItemWithPlayerItem:),
                              NULL, (void *)dcl_replaceItem, (void **)&dcl_orig_replaceItem_fn)) g_hook_count++;
+
+            // 实例化探针（坐实是否走系统播放器，见上方说明）
+            if (DCLReplaceInstanceMethod(playerCls, @selector(initWithPlayerItem:), NULL,
+                             (void *)dcl_initWithItem, (void **)&dcl_orig_initWithItem_fn)) g_hook_count++;
+            if (DCLReplaceInstanceMethod(playerCls, @selector(initWithURL:), NULL,
+                             (void *)dcl_initWithURL, (void **)&dcl_orig_initWithURL_fn)) g_hook_count++;
         }
 
         // 触摸入口：唯一的额外动作就是打个时间戳。

@@ -12,6 +12,8 @@
 #import "DCLSupport.h"
 #import "DCLWatchdog.h"
 #import "DCLPlaybackTracer.h"
+#import "DCLTimeline.h"
+#import "DCLSystemSignal.h"
 #import "DCLHealthCheck.h"
 
 #import <UIKit/UIKit.h>
@@ -51,6 +53,10 @@ static NSUncaughtExceptionHandler *g_prev_uncaught = NULL;
 // 直接覆盖会静默切断宿主自身的崩溃监控与收尾逻辑（上报、保存草稿等）。
 static struct sigaction g_old_sa[NSIG];
 static volatile int g_old_sa_valid[NSIG];
+
+// 自上次启动以来，捕获处理器被顶替后成功夺回的次数（自愈记录，供健康自检展示）
+static NSInteger g_uncaught_heal_count = 0;
+static NSInteger g_signal_heal_count = 0;
 
 // 备用信号栈：栈溢出类崩溃时，处理器不能在已经损坏的栈上运行，
 // 否则必然二次崩溃 —— 而这类崩溃恰恰最需要留下日志。
@@ -294,6 +300,12 @@ static void dcl_signal_handler(int sig, siginfo_t *info, void *uctx) {
     void *frames[64];
     int n = backtrace(frames, 64);
 
+    // 时间线打点：让崩溃也落在同一条轴上，事后能看出「崩溃前 200ms 是不是刚卡过、
+    // 是不是刚切后台」。detail 传静态常量（dcl_signal_name 返回的是字面量），
+    // 内部只做 strncpy 到定长缓冲 —— 不触碰 locale、不做堆分配，
+    // 因此这里刻意不用 snprintf（理由见下方注释）。
+    DCLTimelineRecordC(DCLTlKindCrash, sig, dcl_signal_name(sig));
+
     // 信号处理器内不使用 snprintf：它不在 POSIX async-signal-safe 白名单里，
     // 格式化可能触碰 locale / 内部分配。一律手工拼接（无锁、无分配、无 locale）。
     char type[48];
@@ -367,6 +379,12 @@ static void dcl_uncaught_exception_handler(NSException *exception) {
     // @try/@catch 包裹：捕获模块自身异常，避免覆盖原始崩溃栈
     @try {
         @autoreleasepool {
+            // 时间线打点（OC 异常路径无信号重入约束，可以格式化）
+            char cbuf[96];
+            snprintf(cbuf, sizeof(cbuf), "未捕获异常 %s",
+                     exception.name ? exception.name.UTF8String : "(无名)");
+            DCLTimelineRecordC(DCLTlKindCrash, 0, cbuf);
+
             // OC 异常路径无信号重入风险，用 Foundation 写出可读性更高的报告
             NSString *dir = [DCLCrashReporter crashLogsDirectory];
             NSFileManager *fm = [NSFileManager defaultManager];
@@ -402,6 +420,55 @@ static void dcl_uncaught_exception_handler(NSException *exception) {
     // 转发必须在写完日志之后：原 handler 可能会直接终止进程。
     NSUncaughtExceptionHandler *prev = g_prev_uncaught;
     if (prev) prev(exception);
+}
+
+#pragma mark - 捕获处理器自愈（防止被其他注入模块顶替）
+
+/// 自愈核心：OC 未捕获异常处理器若已被其他模块顶替，夺回并保留链式转发。
+/// 返回是否发生了夺回。仅比对函数地址，不触碰 Foundation 之外的状态。
+///
+/// 关键：被顶替者（宿主或其他注入模块）可能是真正的崩溃上报方，夺回时必须把它
+/// 存为新的 g_prev_uncaught，否则等于反过来切断了对方的链路 —— 与 install / 信号
+/// 路径上「链式转发」的设计是一脉相承的，不能因为自卫就变成新的破坏者。
+static BOOL dcl_reassert_uncaught_exception_handler(void) {
+    if (!g_installed) return NO;
+    void *ours = (void *)(uintptr_t)dcl_uncaught_exception_handler;
+    void *cur = (void *)(uintptr_t)NSGetUncaughtExceptionHandler();
+    if (cur == ours) return NO;
+    g_prev_uncaught = (NSUncaughtExceptionHandler *)cur;
+    NSSetUncaughtExceptionHandler(&dcl_uncaught_exception_handler);
+    g_uncaught_heal_count++;
+    return YES;
+}
+
+/// 自愈核心：致命信号处理器若被顶替，逐信号夺回并保留链式转发。
+/// 返回是否发生了任何夺回。被顶替者的 sigaction 会被保存为新的 g_old_sa[sig]，
+/// 供 dcl_call_previous_handler 继续链式转发。
+static BOOL dcl_reassert_signals(void) {
+    if (!g_installed) return NO;
+    void *ours = (void *)(uintptr_t)dcl_signal_handler;
+    BOOL any = NO;
+    for (size_t i = 0; i < sizeof(dcl_monitored_signals) / sizeof(dcl_monitored_signals[0]); i++) {
+        int sig = dcl_monitored_signals[i];
+        struct sigaction cur;
+        memset(&cur, 0, sizeof(cur));
+        if (sigaction(sig, NULL, &cur) != 0) continue;
+        void *installed = (cur.sa_flags & SA_SIGINFO)
+                        ? (void *)cur.sa_sigaction
+                        : (void *)cur.sa_handler;
+        if (installed == ours) continue;
+        g_old_sa[sig] = cur;          // 保存被顶替者，供链式转发
+        g_old_sa_valid[sig] = 1;
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = dcl_signal_handler;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        sigaction(sig, &sa, NULL);
+        any = YES;
+    }
+    if (any) g_signal_heal_count++;
+    return any;
 }
 
 #pragma mark - 镜像基址表预收集（非崩溃上下文，供崩溃日志映射地址）
@@ -486,6 +553,63 @@ static void dcl_prepare_meta(void) {
 /// 当前注册的未捕获异常处理器地址
 + (void *)currentUncaughtExceptionHandlerPointer {
     return (void *)(uintptr_t)dcl_uncaught_exception_handler;
+}
+
+#pragma mark - 捕获处理器自愈
+
++ (BOOL)healUncaughtExceptionHandlerIfNeeded {
+    BOOL healed = NO;
+    @try { healed = dcl_reassert_uncaught_exception_handler(); } @catch (id e) { (void)e; }
+    if (healed) {
+        [DCLLogger appendRuntimeLine:
+         @"[DCL] self-heal: OC uncaught-exception handler was hijacked, reclaimed"];
+    }
+    return healed;
+}
+
++ (BOOL)healSignalHandlersIfNeeded {
+    BOOL healed = NO;
+    @try { healed = dcl_reassert_signals(); } @catch (id e) { (void)e; }
+    if (healed) {
+        [DCLLogger appendRuntimeLine:
+         @"[DCL] self-heal: signal handler(s) were hijacked, reclaimed"];
+    }
+    return healed;
+}
+
++ (NSInteger)uncaughtExceptionHealCount {
+    return g_uncaught_heal_count;
+}
+
++ (NSInteger)signalHealCount {
+    return g_signal_heal_count;
+}
+
+/// 低频率周期巡检：自动夺回被顶替的捕获处理器。靠「最后写入者胜出」这个事实，
+/// 即便某个共存模块也周期性地抢，我们只要在崩溃发生前的某次巡检里赢一次，
+/// OC 异常 / 致命信号就能回到我们的捕获链路里。
++ (void)startHandlerSelfHealing {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_t q = dispatch_queue_create("com.dcl.selfheal", DISPATCH_QUEUE_SERIAL);
+        dispatch_source_t timer = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+        if (!timer) return;
+        // 首保 5s 后启动，之后每 15s 巡检一次：足以抓住绝大多数「装完又被抢」，
+        // 又低频到对宿主 RunLoop 无感知。
+        uint64_t start    = (uint64_t)(5  * NSEC_PER_SEC);
+        uint64_t interval = (uint64_t)(15 * NSEC_PER_SEC);
+        dispatch_source_set_timer(timer,
+                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)start),
+                                  interval, (uint64_t)(5 * NSEC_PER_SEC));
+        dispatch_source_set_event_handler(timer, ^{
+            @try {
+                [self healUncaughtExceptionHandlerIfNeeded];
+                [self healSignalHandlersIfNeeded];
+            } @catch (id e) { (void)e; }
+        });
+        dispatch_resume(timer);
+    });
 }
 
 #pragma mark - 目录
@@ -817,9 +941,31 @@ static void dcl_prepare_meta(void) {
             [s appendString:@"结论：无（本次会话未观测到主线程卡死；"
                             @"「视频为何暂停」这一类当前为 A 方案零 hook，未挂载播放探针，"
                             @"不具备取证条件 —— 需要请切换 B 方案 full）\n"];
-        } else {
-            [s appendString:@"结论：无（本次会话未观测到视频暂停，也未观测到主线程卡死）\n"];
+            // 即便没有播放钩子，系统层信号与时间线仍然有效 —— 照样输出，
+            // 否则用户会误以为「什么都没采到」。
+            [self dcl_appendTimelineSection:s];
+            return;
         }
+        // full 档却一条都没抓到 —— 这里必须说清是「确实没发生」还是「蹲错了楼层」。
+        // 以前只写一句「未观测到视频暂停」，用户看到的是「插件没干活」，
+        // 而真相很可能是「钩子根本不在调用路径上」。这两种情况的处理方向完全不同，
+        // 日志必须把它们分开写，不能混成一句。
+        if ([DCLTimeline avPlayerSeen]) {
+            [s appendFormat:@"结论：本次会话未观测到视频暂停。\n"
+                            @"  但本会话确实创建过 %lu 个 AVPlayer 实例，说明系统播放器路径是通的、"
+                            @"钩子也挂上了 —— 那么结论是「这段时间确实没有走 pause/play 调用」，"
+                            @"若画面仍然停了，应优先怀疑：① 自研播放器（不走 AVPlayer 的那一路）；"
+                            @"② 画面被主线程冻住而非主动暂停（见下方时间线的卡顿记录）。\n",
+             (unsigned long)[DCLTimeline avPlayerSeenCount]];
+        } else {
+            [s appendString:@"结论：本次会话未观测到视频暂停，且全程未见任何 AVPlayer 实例被创建。\n"
+                            @"  这强烈提示抖音主播放不走系统 AVPlayer（自研播放引擎）。"
+                            @"挂在 AVPlayer 上的 pause/play 钩子命中不了属于**预期结果**，"
+                            @"不是探针写漏了 —— 在那条路径上再加多少钩子都是零。\n"
+                            @"  非越狱条件下拿不到自研引擎内部的 pause 因果，这是硬限制。"
+                            @"可退而求其次：用下方系统层信号（音频中断/前后台/锁屏）与时间线做侧证。\n"];
+        }
+        [self dcl_appendTimelineSection:s];
         return;
     }
 
@@ -882,6 +1028,41 @@ static void dcl_prepare_meta(void) {
         } else {
             [s appendString:@"  主线程栈：未采集（当前为 A 方案零 hook，不 suspend 主线程采样）\n"];
         }
+    }
+
+    [self dcl_appendTimelineSection:s];
+}
+
+/// 统一时间线小节 —— 两档方案都输出。
+///
+/// 存在的意义：把「暂停那一刻前后到底发生了什么」从人脑对表变成代码可查。
+/// 各探针记各的时间戳时，想回答「暂停前 200ms 有没有音频中断 / 主线程是不是正卡着」
+/// 得手工拿 unix 时间去比，精度还对不齐；现在它们共用同一个单调时钟，
+/// 相对毫秒一列直接给出答案。
++ (void)dcl_appendTimelineSection:(NSMutableString *)s {
+    [s appendString:@"\n---------- 统一时间线（所有事件共用同一单调时钟）----------\n"];
+    [s appendFormat:@"累计事件 %llu 条，缓冲内保留最近 %lu 条（环形缓冲，满则覆盖最旧）\n",
+     [DCLTimeline totalRecorded], (unsigned long)[DCLTimeline bufferedCount]];
+
+    NSArray<NSString *> *lines = [DCLTimeline formattedLinesLimit:60];
+    if (lines.count == 0) {
+        [s appendString:@"（暂无事件）\n"];
+    } else {
+        for (NSString *l in lines) [s appendFormat:@"%@\n", l];
+    }
+
+    [s appendFormat:@"\n系统层观测：%@\n", [DCLSystemSignal signalSummary]];
+
+    // 暂停钩子命中过的话，把它前 500ms 的窗口单独摘出来 ——
+    // 这一段才是回答「为什么停」时真正要盯的地方。
+    NSArray<NSString *> *ctx = [DCLTimeline contextLinesBefore:DCLTlKindPauseHook
+                                                     windowMs:500.0
+                                                        limit:12];
+    if (ctx.count) {
+        [s appendString:@"\n最近一次「暂停钩子」命中前 500ms 的上下文：\n"];
+        for (NSString *l in ctx) [s appendFormat:@"%@\n", l];
+    } else if ([DCLTimeline avPlayerSeen]) {
+        [s appendString:@"\n（暂停钩子本会话未命中过，故无「暂停前上下文」可给）\n"];
     }
 }
 

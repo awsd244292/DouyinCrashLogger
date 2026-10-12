@@ -75,6 +75,28 @@ typedef NS_ENUM(NSInteger, DCLPreviousExitKind) {
 /// socket 写失败升级成进程终止，等于凭空制造崩溃）。健康自检只核对这些。
 + (NSArray<NSNumber *> *)monitoredSignals;
 
+/// 自愈：若 OC 未捕获异常处理器已被其他共存模块（如 libMetalMetricsInterpose.dylib）
+/// 顶替，夺回处理器并把被顶替者保留为链式转发的上游。返回是否发生了夺回。
+///
+/// 设计背景：本插件的 install 只在 dyld constructor 阶段装一次。若某共存模块随后
+/// 调用 NSSetUncaughtExceptionHandler 覆盖我们，OC 异常捕获链路会静默失效——
+/// 本会话的 NSException 崩溃将完全没有记录，且健康自检会把它误报成「插件坏了」。
++ (BOOL)healUncaughtExceptionHandlerIfNeeded;
+
+/// 自愈：若某个致命信号处理器被其他模块顶替，夺回并保留链式转发。
+/// 返回是否发生了任何夺回。与上面的 OC 异常自愈是同一类修复，对称实现。
++ (BOOL)healSignalHandlersIfNeeded;
+
+/// 启动低频率（默认 15s）的周期性自愈计时器，自动夺回被顶替的捕获处理器。
+/// 必须在 install 之后调用（建议放在 DCLMain 的延迟主线程块里）；重复调用安全。
++ (void)startHandlerSelfHealing;
+
+/// 自上次启动以来，OC 异常处理器被夺回的次数（健康自检展示用）。
++ (NSInteger)uncaughtExceptionHealCount;
+
+/// 自上次启动以来，信号处理器被夺回的次数（健康自检展示用）。
++ (NSInteger)signalHealCount;
+
 /// 自建线程调用：为该线程安装备用信号栈（sigaltstack 是 per-thread 的），
 /// 使栈溢出类崩溃也能留下日志。
 + (void)installSignalStackOnCurrentThread;

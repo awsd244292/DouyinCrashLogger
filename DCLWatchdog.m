@@ -8,6 +8,8 @@
 
 #import "DCLCrashReporter.h"
 #import "DCLSupport.h"   // DCLNowUs：全插件统一的微秒时钟实现
+#import "DCLTimeline.h"  // 统一时间线：卡顿与播放事件必须落在同一条轴上
+#import <stdio.h>        // snprintf
 
 #import <dlfcn.h>
 #import <mach/mach.h>
@@ -386,6 +388,13 @@ static void dcl_record_stall(uint64_t startUs, uint64_t endUs,
     [g_stalls addObject:r];
     while (g_stalls.count > 6) [g_stalls removeObjectAtIndex:0];
     pthread_mutex_unlock(&g_stalls_lock);
+
+    // 统一时间线打点：主线程卡顿是「画面被冻住」的直接证据。
+    // 只有把它和播放事件放在同一条轴上，才能回答用户真正想问的那句 ——
+    // 「视频停的时候，到底是我点的、系统打断的，还是主线程卡住把画面冻住了」。
+    char tbuf[96];
+    snprintf(tbuf, sizeof(tbuf), "卡顿 %.0f ms：%s", r.durationMs, causeText.UTF8String);
+    DCLTimelineRecordC(DCLTlKindMainThreadStall, (int32_t)r.durationMs, tbuf);
 }
 
 static void dcl_watchdog_main(void) {

@@ -33,53 +33,78 @@
 #pragma mark - 各项检查
 
 /// 1) 信号处理器是否仍由本模块持有（防止被其他注入插件覆盖）
+/// 内部：把「当前各信号处理器状态」分类为 lost（被别的模块接走）/ reset（被重置为默认/忽略）
++ (void)classifySignalStateLost:(NSMutableArray **)lostOut reset:(NSMutableArray **)resetOut {
+    void *ours = [DCLCrashReporter currentSignalHandlerPointer];
+    NSArray<NSNumber *> *monitored = [DCLCrashReporter monitoredSignals];
+    NSMutableArray *lost = [NSMutableArray array];
+    NSMutableArray *reset = [NSMutableArray array];
+    // 只核对本模块真正接管的信号。刻意不含 SIGPIPE ——
+    // 把它算进来会把「按设计不接管」误报成「被别人抢走」，天天刷告警，
+    // 反而把真正有价值的告警淹没掉。
+    for (NSNumber *num in monitored) {
+        int sig = num.intValue;
+        struct sigaction cur;
+        memset(&cur, 0, sizeof(cur));
+        sigaction(sig, NULL, &cur);
+        void *installed = (cur.sa_flags & SA_SIGINFO)
+                        ? (void *)(uintptr_t)cur.sa_sigaction
+                        : (void *)(uintptr_t)cur.sa_handler;
+        if (installed == ours) continue;
+        if (!installed || installed == (void *)SIG_DFL || installed == (void *)SIG_IGN) {
+            [reset addObject:num];
+        } else {
+            [lost addObject:num];
+        }
+    }
+    *lostOut = lost;
+    *resetOut = reset;
+}
+
 + (DCLHealthItem *)checkSignalHandlers {
     DCLHealthItem *it = [DCLHealthItem new];
     it.name = @"崩溃信号处理器";
     @try {
-        void *ours = [DCLCrashReporter currentSignalHandlerPointer];
-        // 只核对本模块真正接管的信号。刻意不含 SIGPIPE ——
-        // 把它算进来会把「按设计不接管」误报成「被别人抢走」，天天刷告警，
-        // 反而把真正有价值的告警淹没掉。
-        NSArray<NSNumber *> *monitored = [DCLCrashReporter monitoredSignals];
-        NSMutableArray *lost = [NSMutableArray array];    // 被其他模块接走
-        NSMutableArray *reset = [NSMutableArray array];   // 被重置为默认/忽略
+        NSMutableArray *lost = nil, *reset = nil;
+        [self classifySignalStateLost:&lost reset:&reset];
+        NSUInteger total = [DCLCrashReporter monitoredSignals].count;
 
-        for (NSNumber *num in monitored) {
-            int sig = num.intValue;
-            struct sigaction cur;
-            memset(&cur, 0, sizeof(cur));
-            sigaction(sig, NULL, &cur);
-            void *installed = (cur.sa_flags & SA_SIGINFO)
-                            ? (void *)(uintptr_t)cur.sa_sigaction
-                            : (void *)(uintptr_t)cur.sa_handler;
-            if (installed == ours) continue;
-            if (!installed || installed == (void *)SIG_DFL || installed == (void *)SIG_IGN) {
-                [reset addObject:num];
-            } else {
-                [lost addObject:num];
-            }
-        }
-
-        NSUInteger total = monitored.count;
         if (lost.count == 0 && reset.count == 0) {
             it.level = DCLHealthLevelPass;
             it.evidence = [NSString stringWithFormat:
                            @"%lu 个致命信号(SIGABRT/SEGV/BUS/TRAP/ILL/FPE)的当前处理器"
                            @"均指向本模块函数地址 0x%llx",
-                           (unsigned long)total, (unsigned long long)(uintptr_t)ours];
-        } else if (lost.count + reset.count < total) {
+                           (unsigned long)total,
+                           (unsigned long long)(uintptr_t)[DCLCrashReporter currentSignalHandlerPointer]];
+            return it;
+        }
+
+        // 检测到被顶替：先尝试自愈夺回，再复核夺回后的真实状态。
+        [DCLCrashReporter healSignalHandlersIfNeeded];
+        NSMutableArray *lost2 = nil, *reset2 = nil;
+        [self classifySignalStateLost:&lost2 reset:&reset2];
+
+        if (lost2.count == 0 && reset2.count == 0) {
+            it.level = DCLHealthLevelWarn;   // 已修好，但这一轮确实出现过顶替
+            NSMutableString *d = [NSMutableString string];
+            if (lost.count) [d appendFormat:@"信号 %@ 曾被其他模块接管",
+                              [lost componentsJoinedByString:@", "]];
+            if (reset.count) [d appendFormat:@"%@信号 %@ 曾被重置为默认/忽略",
+                              lost.count ? @"；" : @"", [reset componentsJoinedByString:@", "]];
+            [d appendString:@"，已自愈夺回（这部分崩溃现在能抓到了）"];
+            it.evidence = d;
+        } else if (lost2.count + reset2.count < total) {
             it.level = DCLHealthLevelWarn;
             NSMutableString *d = [NSMutableString string];
-            if (lost.count)  [d appendFormat:@"信号 %@ 已被其他模块接管",
-                              [lost componentsJoinedByString:@", "]];
-            if (reset.count) [d appendFormat:@"%@信号 %@ 已被重置为默认/忽略",
-                              lost.count ? @"；" : @"", [reset componentsJoinedByString:@", "]];
-            [d appendString:@"，这部分崩溃将抓不到"];
+            if (lost2.count)  [d appendFormat:@"信号 %@ 已被其他模块接管",
+                               [lost2 componentsJoinedByString:@", "]];
+            if (reset2.count) [d appendFormat:@"%@信号 %@ 已被重置为默认/忽略",
+                               lost2.count ? @"；" : @"", [reset2 componentsJoinedByString:@", "]];
+            [d appendString:@"，这部分崩溃将抓不到（自愈未能全部夺回）"];
             it.evidence = d;
         } else {
             it.level = DCLHealthLevelFail;
-            it.evidence = @"全部信号处理器均已失效，本插件的崩溃捕获不可用";
+            it.evidence = @"全部信号处理器均已失效，自愈未能夺回，本插件的崩溃捕获不可用";
         }
     } @catch (id e) {
         it.level = DCLHealthLevelFail;
@@ -99,11 +124,22 @@
             it.level = DCLHealthLevelPass;
             it.evidence = @" NSGetUncaughtExceptionHandler() 返回的正是本模块处理器";
         } else {
-            it.level = DCLHealthLevelFail;
-            it.evidence = [NSString stringWithFormat:
-                           @"已被替换：当前 0x%llx，本模块 0x%llx",
-                           (unsigned long long)(uintptr_t)cur,
-                           (unsigned long long)(uintptr_t)ours];
+            // 检测到被顶替：先尝试自愈夺回，再据结果给结论（而非直接判死）。
+            BOOL healed = [DCLCrashReporter healUncaughtExceptionHandlerIfNeeded];
+            if (healed) {
+                it.level = DCLHealthLevelWarn;
+                it.evidence = [NSString stringWithFormat:
+                               @"曾被替换(0x%llx)，已自愈夺回；本模块 0x%llx。若反复出现，"
+                               @"说明有共存模块在抢这个 handler（如 libMetalMetricsInterpose）",
+                               (unsigned long long)(uintptr_t)cur,
+                               (unsigned long long)(uintptr_t)ours];
+            } else {
+                it.level = DCLHealthLevelFail;
+                it.evidence = [NSString stringWithFormat:
+                               @"已被替换：当前 0x%llx，本模块 0x%llx；自愈尝试未生效",
+                               (unsigned long long)(uintptr_t)cur,
+                               (unsigned long long)(uintptr_t)ours];
+            }
         }
     } @catch (id e) {
         it.level = DCLHealthLevelFail;

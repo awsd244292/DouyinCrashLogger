@@ -39,6 +39,7 @@
 #import "DCLConfig.h"
 #import "DCLHotSwitch.h"
 #import "DCLLogger.h"
+#import "DCLSystemSignal.h"
 
 __attribute__((constructor)) static void dcl_entry(void) {
     @try {
@@ -77,6 +78,10 @@ __attribute__((constructor)) static void dcl_entry(void) {
             // 看门狗：只挂 CFRunLoopObserver（公开 API，非 hook），两档方案都装 ——
             // 「卡了多久」是最基础的事实，没有理由因为方案降级而放弃。
             [DCLWatchdog install];
+
+            // 系统层信号探针：只注册通知 + 只读 runtime 查询，零方法交换，
+            // 所以两档方案都装 —— 它是「自研播放器钩不到」时的兜底证据来源。
+            [DCLSystemSignal install];
 
             // 播放探针会交换 AVPlayer / UIApplication 的方法实现 —— 只有 B 方案（full）才装。
             // A 方案（safe）下这一分支不执行，本进程内不会有任何方法交换。
