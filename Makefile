@@ -51,7 +51,7 @@ PKG_VER   := $(subst .,_,$(VERSION))
 FILES := DCLMain.m DCLConstants.m DCLCrashReporter.m DCLWatchdog.m DCLPlaybackTracer.m \
          DCLHealthCheck.m DCLConfig.m DCLHotSwitch.m DCLLogger.m DCLSupport.m
 
-CFLAGS := -fobjc-arc -O0 -Wno-deprecated-declarations -fno-objc-msgsend-selector-stubs
+CFLAGS := -fobjc-arc -O0 -Wno-deprecated-declarations
 SYSROOT_FLAGS := -isysroot $(SDKROOT)
 FRAMEWORK_DIRS := $(SDKROOT)/System/Library/Frameworks $(SDKROOT)/System/Library/PrivateFrameworks
 FW_FLAGS := $(foreach d,$(FRAMEWORK_DIRS),-F$(d))

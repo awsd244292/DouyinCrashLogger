@@ -86,7 +86,7 @@ jobs:
       - name: Static precheck (no SDK needed)
         run: make precheck
 
-      - name: Build injectable dylib (fat arm64 + arm64e)
+      - name: Build injectable dylib (arm64)
         run: make dylib
 
       - name: Build .deb (rootful; 巨魔/自签注入只用上面的 dylib)
