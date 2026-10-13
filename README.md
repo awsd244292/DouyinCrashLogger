@@ -9,8 +9,8 @@
 ## 功能
 
 - 📝 **崩溃捕获**
-  - POSIX 信号：`SIGABRT` / `SIGSEGV` / `SIGBUS` / `SIGTRAP` / `SIGILL` / `SIGFPE` / `SIGPIPE`
-    （你遇到的 `Fatal signal 5` = `SIGTRAP` 会被捕获）
+  - POSIX 信号：`SIGABRT` / `SIGSEGV` / `SIGBUS` / `SIGTRAP` / `SIGILL` / `SIGFPE`
+    （你遇到的 `Fatal signal 5` = `SIGTRAP` 会被捕获；`SIGPIPE` 故意**不**接管——iOS App 普遍把它设为 `SIG_IGN`，一旦接管，任何一次 socket 写失败都会被误升为崩溃，看起来像"抖音又闪退了"）
   - Objective-C 未捕获异常（`NSUncaughtException`）
   - 记录：设备型号、系统版本、抖音包名/版本、**崩溃类型与原因**、故障地址、崩溃线程回溯
 - 📂 **日志落盘**：写入抖音沙盒 `Documents/DouyinCrashLogs/`，按时间命名，自动保留最近 20 条
@@ -35,12 +35,21 @@
 > 全程不使用 Logos `%hook`（那会引入 `_MSHookMessageEx` 等需要 substrate 的符号）。
 > 因此即使设备没有 mobilesubstrate，dyld 也能正常加载该 dylib。
 
+> **捕获层与抖音彻底解耦（代码核实，见 `DCLCrashReporter.m` 全文 + 工程 grep）**：
+> 不仅不依赖 substrate，也**不 hook 任何一个抖音 / `Aweme` 私有类**——
+> 崩溃捕获只装 POSIX 信号 + `NSSetUncaughtExceptionHandler`，与被注入 App 的 UI / 私有实现零耦合。
+> 因此**抖音版本迭代不会让"崩溃捕获"本身失效**。工程里仅有的两处抖音耦合都属于可降级项：
+> ① 可选的"播放暂停诊断"探针（hook 的是公开类 `AVPlayer`，属增强而非核心捕获）；
+> ② 设置入口接入 `DYStorageManager`（运行时注册，类不存在则 `nil` 跳过）。
+> 这是本项目的架构红线——**新增任何功能都禁止把核心捕获链路上绑到抖音私有类**。
+
 ---
 
 ## 注入到抖音（自签 / 巨魔）
 
-产物是 **`DouyinCrashLogger.dylib`**（fat `arm64` + `arm64e`，无越狱路径残留）。
-`control` 已移除 `mobilesubstrate` 依赖。
+产物是 **`DouyinCrashLogger.dylib`**（`arm64`，无越狱路径残留）。
+LLVM `ld64.lld` 编不出真正的 `arm64e`（ptrauth ABI 缺失），故本工程只交付 `arm64`——
+注入到 `arm64e` 宿主 App 无影响（dyld 支持混合加载）。`control` 已移除 `mobilesubstrate` 依赖。
 
 **方式 A — TrollStore（巨魔，推荐）**
 1. 安装 TrollStore + [TrollFools](https://github.com/Lessica/TrollFools)

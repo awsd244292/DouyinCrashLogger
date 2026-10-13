@@ -12,8 +12,12 @@
 //
 //  接入原则（对齐 DYStorage 官方 README）：
 //    · 不链接 DYStorage —— 通过 NSClassFromString 在运行时取类，未安装则自然跳过；
-//    · 注册一个「负责展示本插件设置页的 block」，点击时由 DYStorage 回调本插件；
-//    · 不在全局保存控制器 / view model，只在用户点击的瞬间创建并 present。
+//    · 优先用 registerController 把「设置页 VC 类名」交给 DYStorage 统一渲染跳转
+//      （push 进其设置页导航栈 / 包进全屏 modal present），本插件不再自 present，
+//      更贴合「统一渲染」设计，也避免自己 present 与 DYStorage 导航栈打架；
+//    · 旧版 DYStorage 无 registerController 时回退 registerAction：注册一个
+//      「负责展示本插件设置页的 block」，点击时由 DYStorage 回调本插件再 present；
+//    · 不在全局保存控制器 / view model，只在用户点击的瞬间创建并展示。
 //
 
 #import <Foundation/Foundation.h>

@@ -32,6 +32,10 @@ typedef void (^DYStorageAction)(void);
                                title:(NSString *)title
                              version:(NSString *)version
                               action:(DYStorageAction)action;
+- (BOOL)registerControllerWithIdentifier:(NSString *)identifier
+                                   title:(NSString *)title
+                                 version:(NSString *)version
+                              controller:(NSString *)controllerClassName;
 @end
 
 static NSString *const kDCLStorageIdentifier = @"com.awsd244292.douyincrashlogger";
@@ -63,10 +67,22 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
         id mgr = [mgrClass sharedManager];
         if (mgr == nil) return;
 
-        // 3) 注册「点击时展示本插件设置页」的 block。版本号跟随 control，方便排查。
-        SEL sel = @selector(registerActionWithIdentifier:title:version:action:);
-        if (![mgr respondsToSelector:sel]) return;
+        // 3) 优先 registerController：把设置页 VC 类名交给 DYStorage 统一渲染跳转
+        //    （push 进其设置页导航栈 / 包进全屏 modal present），本插件不再自 present，
+        //    更贴合「统一渲染」设计，也避免自己 present 与 DYStorage 导航栈打架。
+        SEL selCtl = @selector(registerControllerWithIdentifier:title:version:controller:);
+        if ([mgr respondsToSelector:selCtl]) {
+            [mgr registerControllerWithIdentifier:kDCLStorageIdentifier
+                                           title:kDCLStorageEntryTitle
+                                         version:DCLPluginVersion
+                                      controller:NSStringFromClass([DCLSettingsViewController class])];
+            return;
+        }
 
+        // 4) 兜底 registerAction：旧版 DYStorage 无 registerController 时，注册一个
+        //    点击回调 block，由 DYStorage 回调本插件后再自 present（与改造前行为一致）。
+        SEL selAct = @selector(registerActionWithIdentifier:title:version:action:);
+        if (![mgr respondsToSelector:selAct]) return;
         [mgr registerActionWithIdentifier:kDCLStorageIdentifier
                                     title:kDCLStorageEntryTitle
                                   version:DCLPluginVersion
@@ -339,7 +355,21 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
 }
 
 - (void)dismissSelf {
-    [self dismissViewControllerAnimated:YES completion:nil];
+    // 入口通道（Tweak.xm DYStoragePresentController）保证我们的 VC 永远在导航栈内，
+    // 分两种落点，关闭逻辑必须兼顾：
+    //   · Case A：顶层 VC 自带 nav → pushViewController，本 VC 是栈内非根 → pop 返回；
+    //   · Case B：顶层 VC 无 nav → 包一层新 UINavigationController 全屏 modal present，
+    //     本 VC 是「新 nav 的栈底」。此时 self.presentingViewController 为 nil、
+    //     self.navigationController 虽存在却不可 pop（空操作），必须沿 nav 的
+    //     presentingViewController 把最外层整层 dismiss 掉。
+    UINavigationController *nav = self.navigationController;
+    if (nav && nav.viewControllers.firstObject != self) {
+        [nav popViewControllerAnimated:YES];
+    } else if (nav.presentingViewController) {
+        [nav.presentingViewController dismissViewControllerAnimated:YES completion:nil];
+    } else {
+        [self dismissViewControllerAnimated:YES completion:nil];
+    }
 }
 
 @end

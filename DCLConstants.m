@@ -6,7 +6,7 @@
 #import "DCLConstants.h"
 
 // 与 control 的 Version 同步，改一处必须改另一处
-NSString * const DCLPluginVersion = @"1.4-5";
+NSString * const DCLPluginVersion = @"1.4-6";
 
 NSString * const DCLCrashLogsRelativeDir = @"Documents/DouyinCrashLogs";
 NSUInteger const DCLMaxRetainedLogs = 20;
