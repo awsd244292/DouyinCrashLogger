@@ -17,6 +17,7 @@
 
 #import "DCLConfig.h"
 #import "DCLCrashReporter.h"
+#import "DCLPlaybackTracer.h"
 #import "DCLConstants.h"
 
 #import <UIKit/UIKit.h>
@@ -41,7 +42,7 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
 // unknown class）。presentSettings 定义在本文件上半部，需在它之前看到完整接口。
 @interface DCLSettingsViewController : UIViewController
 @property (nonatomic, strong) UITextView *statusView;
-@property (nonatomic, strong) UIButton *profileButton;
+@property (nonatomic, strong) UISwitch *hookSwitch;
 @property (nonatomic, strong) UIButton *refreshButton;
 @property (nonatomic, strong) UIButton *exportButton;
 @property (nonatomic, strong) UIButton *clearButton;
@@ -164,8 +165,15 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
     self.statusView.layer.cornerRadius = 10;
     self.statusView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
 
-    self.profileButton = [self makeButton:@"切换采集方案（safe ⇄ full）"
-                                   action:@selector(toggleProfile)];
+    // 显式 Hook 开关行：开 = full（Hook 全开）/ 关 = safe（零 Hook）。
+    // 这是「hook ⇄ 0hook」的直观入口，与摇一摇、capture_mode.txt 三选一等效。
+    self.hookSwitch = [[UISwitch alloc] init];
+    self.hookSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.hookSwitch addTarget:self
+                        action:@selector(onHookChanged)
+              forControlEvents:UIControlEventValueChanged];
+    UIView *hookRow = [self switchRowWithTitle:@"方法交换（Hook）" control:self.hookSwitch];
+
     self.refreshButton = [self makeButton:@"刷新 latest.log 快照"
                                    action:@selector(refreshSnapshot)];
     self.exportButton  = [self makeButton:@"导出日志目录"
@@ -174,7 +182,7 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
                                    action:@selector(clearLogs)];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        self.statusView, self.profileButton, self.refreshButton,
+        self.statusView, hookRow, self.refreshButton,
         self.exportButton, self.clearButton
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -215,19 +223,76 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
     return b;
 }
 
+- (UIView *)switchRowWithTitle:(NSString *)title control:(UISwitch *)sw {
+    UIView *row = [[UIView alloc] init];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    row.backgroundColor = [UIColor tertiarySystemBackgroundColor];
+    row.layer.cornerRadius = 10;
+
+    UILabel *lab = [[UILabel alloc] init];
+    lab.translatesAutoresizingMaskIntoConstraints = NO;
+    lab.text = title;
+    lab.font = [UIFont systemFontOfSize:15];
+    lab.textColor = [UIColor labelColor];
+
+    [row addSubview:lab];
+    [row addSubview:sw];
+    [NSLayoutConstraint activateConstraints:@[
+        [lab.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:14],
+        [lab.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [sw.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-12],
+        [sw.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [row.heightAnchor constraintEqualToConstant:48],
+    ]];
+    return row;
+}
+
 - (void)refreshStatus {
+    BOOL hooksOn = [DCLConfig hooksEnabled];
+    self.hookSwitch.on = hooksOn;
+
     NSMutableString *s = [NSMutableString string];
     [s appendString:@"DouyinCrashLogger · 崩溃取证\n"];
     [s appendFormat:@"版本：%@\n", DCLPluginVersion];
-    [s appendFormat:@"当前采集方案：%@\n", [DCLConfig profileDisplayName]];
+    [s appendFormat:@"采集方案：%@\n", [DCLConfig profileDisplayName]];
+    [s appendFormat:@"方法交换（Hook）：%@\n", hooksOn ? @"开启（full）" : @"关闭（safe · 零 hook）"];
+
+    // 配置期望 vs 运行时已挂载：讲清「配置已改，但当前进程是否已换」的差异，
+    // 避免用户以为「切了开关 Hook 就立刻增减」——方法交换在启动早期装一次。
+    NSUInteger hooked = [DCLPlaybackTracer hookedCount];
+    if (hooksOn && hooked == 0) {
+        [s appendString:@"⚠️ 当前进程未挂载 Hook（本次启动为零 Hook），重启抖音后开启完全生效\n"];
+    } else if (!hooksOn && hooked > 0) {
+        [s appendString:@"⚠️ 当前进程 Hook 仍在运行（本次启动为 full），重启抖音后关闭\n"];
+    } else {
+        [s appendFormat:@"运行时 Hook 状态：已挂载 %lu 处（与配置一致）\n", (unsigned long)hooked];
+    }
+
     [s appendFormat:@"上次退出性质：%@\n", [DCLCrashReporter previousExitDescription]];
     [s appendFormat:@"日志目录：%@\n", [DCLCrashReporter crashLogsDirectory]];
+    [s appendString:@"\n提示：摇一摇也可快速切换档位；切换后重启抖音完全生效"];
     self.statusView.text = s;
 }
 
-- (void)toggleProfile {
-    [DCLConfig toggleProfile];
+/// Hook 开关拨动：直接翻转 safe/full 档位。
+/// 诚实告知：方法交换在抖音启动早期一次性安装，本会话即时生效的是「配置 + 日志显示」，
+/// 真正的 Hook 增减要等下次启动抖音重新评估（详见 DCLMain 延迟安装分支）。
+- (void)onHookChanged {
+    BOOL on = self.hookSwitch.on;
+    [DCLConfig setProfile: on ? DCLCaptureProfileFull : DCLCaptureProfileSafe];
     [self refreshStatus];
+
+    NSString *title = on ? @"已切换到 Hook 全开（full）" : @"已切换到 零 Hook（safe）";
+    NSString *msg = @"采集档位已保存。Hook 在抖音启动早期一次性安装，本会话即时生效的是「配置与日志显示」；"
+                    "Hook 实际增减将在「下次启动抖音」时完全切换。";
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:title
+                                           message:msg
+                                    preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                             style:UIAlertActionStyleDefault
+                                           handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)refreshSnapshot {
