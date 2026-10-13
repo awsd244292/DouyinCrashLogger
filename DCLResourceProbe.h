@@ -30,6 +30,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// 启动周期采样。任意线程可调用，内部自行切队列。重复调用只有第一次生效。
 + (void)start;
 
+/// 停止周期采样并释放队列/定时器（总开关 off 时用）。
+/// 已采到的水位数据留在内存里供 latest.log 读取，只是不再继续采。
++ (void)stop;
+
 /// 上一轮会话遗留下来的水位快照。首次安装返回 nil。
 /// 字段：peakFootprint / lastFootprint / lastAvailable / lastStallMs / samples
 + (NSDictionary<NSString *, id> * _Nullable)previousSessionWatermark;

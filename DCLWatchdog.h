@@ -49,6 +49,11 @@ typedef NS_ENUM(NSUInteger, DCLStallCause) {
 /// 安装看门狗。必须在主线程调用一次（延迟执行，绝不在 constructor 里）。
 + (void)install;
 
+/// 停止看门狗并卸载 RunLoop 观察者（总开关 off 时用）。
+/// 后台线程靠 g_wd_stop 标志自然退出 —— 从外面 cancel 一个 NSThread 是不受支持的做法，
+/// 让它自己看见「该收工了」再退出，才是稳的。
++ (void)uninstall;
+
 /// 触摸记录（由 UIApplication sendEvent: 的旁路钩子更新）
 + (NSTimeInterval)lastTouchUnix;
 + (void)noteTouch;

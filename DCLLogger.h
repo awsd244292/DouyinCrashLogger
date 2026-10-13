@@ -54,6 +54,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// 接管是否成功（供健康自检展示，避免「看着没输出」时无从判断）
 + (BOOL)stderrCaptureInstalled;
 
+/// 总开关 off：把 stderr / stdout 还给宿主，并让日志泵线程收工。
+///
+/// 「归还通道」这一步没有替代品 —— 丢了宿主的 stderr 是永久致盲，不可逆。
+/// 停掉之后再调用 installStderrCapture 可以重新接管（故这里刻意不用 dispatch_once）。
++ (void)stopStderrCapture;
+
+/// 是否还在往 runtime 日志里写字。off 时置 NO：此后所有 append（含日志泵收尾时
+/// 补写的半行残留）一律丢弃，真正做到「一个字节都不再写」。
+/// 调用方可在置 NO 之前先 append 一行说明，那一行仍会落盘。
++ (void)setLoggingEnabled:(BOOL)enabled;
+
 /// 单会话日志大小上限（健康自检拿它做判据，避免各处再抄一遍魔数）
 + (NSUInteger)runtimeLogMaxBytes;
 

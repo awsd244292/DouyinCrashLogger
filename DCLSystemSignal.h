@@ -33,6 +33,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// 两档方案都调用 —— 本模块零 hook，没有理由在 safe 档下放弃这部分证据。
 + (void)install;
 
+/// 摘掉全部系统信号观察者（总开关 off 时用）。
+/// 这些观察者是 addObserverForName:...usingBlock: 装的，必须靠返回的 token 才能精确移除 ——
+/// install 时逐个存下来，就是为了此刻能一个个 removeObserver: 回去。
++ (void)uninstall;
+
 /// 已成功注册的信号源数量（健康自检用：>0 说明在系统层有观测点）
 + (NSUInteger)registeredCount;
 

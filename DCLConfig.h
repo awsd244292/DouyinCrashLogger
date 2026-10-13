@@ -45,6 +45,7 @@ NS_ASSUME_NONNULL_BEGIN
 typedef NS_ENUM(NSUInteger, DCLCaptureProfile) {
     DCLCaptureProfileSafe = 0,  ///< A 方案：零 hook，只抓崩溃 / 退出性质 / 卡死时长 / 自检
     DCLCaptureProfileFull = 1,  ///< B 方案：hook 全开，在 A 之上抓调用栈与全线程快照
+    DCLCaptureProfileOff  = 2,  ///< 总开关关闭：插件拒绝一切活动（详见 isDisabled 的说明）
 };
 
 @interface DCLConfig : NSObject
@@ -57,6 +58,17 @@ typedef NS_ENUM(NSUInteger, DCLCaptureProfile) {
 
 /// 方案中文名，写进日志：@"A 方案（safe，零 hook）" / @"B 方案（full，hook 全开）"
 + (NSString *)profileDisplayName;
+
+/// 总开关是否被关掉（off 档）。
+///
+/// off 的语义是「拒绝此插件所有活动」：崩溃捕获 / 卡死看门狗 / 播放探针 /
+/// 时间线落盘 / 资源采样 / stderr 接管 / 日志写入，一律不装或立即卸掉。
+///
+/// 唯一的两处例外（刻意保留，否则用户再也切不回来）：
+///   1) 摇一摇检测 —— 它是唯一的自救通道，卸掉就只能靠沙盒文件改回来；
+///   2) DYStorage / 设置页入口行 —— 同上，给一个能点回来的地方。
+/// 这两处本身零采集、零写盘，不构成「活动」。
++ (BOOL)isDisabled;
 
 /// 是否允许方法交换（hook）。仅 full 为 YES —— DCLMain 据此决定是否安装播放探针。
 + (BOOL)hooksEnabled;
@@ -80,7 +92,7 @@ typedef NS_ENUM(NSUInteger, DCLCaptureProfile) {
 /// 双写 NSUserDefaults 与 capture_mode.txt —— 即使完全退出重启抖音也保持生效。
 + (void)setProfile:(DCLCaptureProfile)profile;
 
-/// 在 safe / full 之间翻转（摇一摇热切换入口）
+/// 三态循环切换：safe → full → off → safe（摇一摇热切换入口）
 + (void)toggleProfile;
 
 @end

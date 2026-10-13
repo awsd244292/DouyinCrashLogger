@@ -86,6 +86,16 @@ static int g_saved_err = -1;
 static int g_saved_out = -1;
 static int32_t g_capture_ok = 0;
 
+// —— 总开关 off 相关的两个闸门 ——
+// g_logging_enabled：off 后所有 append 一律丢弃（连泵收尾补的半行残留也不写）。
+// g_pump_stop：让泵线程在下一轮循环体里自行退出，不靠外部硬杀线程。
+static volatile int32_t g_logging_enabled = 1;
+static volatile int32_t g_pump_stop = 0;
+
+// 接管 / 归还都动 fd，且 off → on 切换时要能重新接管（故不能是 dispatch_once），
+// 用一把互斥锁守住，避免「重装与停泵」撞在一起时 fd 被覆盖成半新半旧。
+static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+
 #pragma mark - 文件 IO（只在队列内调用）
 
 static NSString *dcl_runtime_path(void) { return [DCLLogger runtimeLogPath]; }
@@ -410,7 +420,10 @@ static void dcl_pump_feed(NSMutableData *stage, const char *bytes, size_t len,
 }
 
 static void *dcl_log_pump(void *ctx) {
-    (void)ctx;
+    // 读端 fd 由创建时随参带进来，而不是循环里去读全局 g_pipe_read。
+    // 原因很实在：off → on 切换会重新 pipe，全局值会被换成新 fd；若泵读的是全局，
+    // 上一轮还没退干净的老泵就会去读新管道，两边的日志互相抢字节。
+    int fd = (int)(intptr_t)ctx;
     pthread_setname_np("com.dcl.log-pump");
 
     char chunk[4096];
@@ -419,7 +432,8 @@ static void *dcl_log_pump(void *ctx) {
 
     while (1) {
         @autoreleasepool {
-            ssize_t n = read(g_pipe_read, chunk, sizeof(chunk));
+            if (g_pump_stop) break;   // 总开关已归零，收工
+            ssize_t n = read(fd, chunk, sizeof(chunk));
             if (n > 0) {
                 dcl_pump_feed(stage, chunk, (size_t)n, batch);
                 if (batch.count) {
@@ -442,10 +456,12 @@ static void *dcl_log_pump(void *ctx) {
         if ([stage length]) {
             NSString *s = [[NSString alloc] initWithBytes:[stage bytes] length:[stage length]
                                                  encoding:NSUTF8StringEncoding];
+            // off 之后这一行会被 setLoggingEnabled:NO 挡掉，不会漏进别人的文件里。
             [DCLLogger appendRuntimeLine:s ?: @"(undecodable tail)"];
         }
         dcl_restore_original_streams();
     }
+    if (fd >= 0) close(fd);   // 自己的读端自己收，别去碰可能被换过的全局值
     return NULL;
 }
 
@@ -512,63 +528,97 @@ static void *dcl_log_pump(void *ctx) {
     }
 }
 
-+ (void)installStderrCapture {
-    static dispatch_once_t onceInstall;
-    dispatch_once(&onceInstall, ^{
-        @try {
-            [[NSFileManager defaultManager] createDirectoryAtPath:[self logsDirectory]
-                                      withIntermediateDirectories:YES
-                                                       attributes:nil
-                                                            error:nil];
+/// 真正接管的活儿（调用方已持 g_capture_lock）。拆成独立函数是为了让中途的失败
+/// 能直接 return —— 锁内 return 会漏解锁，那是必现死锁。
+static BOOL dcl_attach_capture_locked(void) {
+    @try {
+        [[NSFileManager defaultManager] createDirectoryAtPath:[DCLLogger logsDirectory]
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
 
-            int fds[2];
-            if (pipe(fds) != 0) return;
+        int fds[2];
+        if (pipe(fds) != 0) return NO;
 
-            // 关键安全阀：写端非阻塞。泵线程万一出事，宿主的 fprintf 也只会拿到
-            // EAGAIN 直接失败，绝不会出现「写日志把抖音 UI 线程卡住」这种反向事故。
-            int fl = fcntl(fds[1], F_GETFL, 0);
-            if (fl >= 0) fcntl(fds[1], F_SETFL, fl | O_NONBLOCK);
+        // 关键安全阀：写端非阻塞。泵线程万一出事，宿主的 fprintf 也只会拿到
+        // EAGAIN 直接失败，绝不会出现「写日志把抖音 UI 线程卡住」这种反向事故。
+        int fl = fcntl(fds[1], F_GETFL, 0);
+        if (fl >= 0) fcntl(fds[1], F_SETFL, fl | O_NONBLOCK);
 
-            int savedErr = dup(STDERR_FILENO);
-            int savedOut = dup(STDOUT_FILENO);
-            if (dup2(fds[1], STDERR_FILENO) < 0) {
-                close(fds[0]); close(fds[1]); close(savedErr); close(savedOut);
-                return;
-            }
-            if (dup2(fds[1], STDOUT_FILENO) < 0) {
-                dup2(savedErr, STDERR_FILENO);
-                close(fds[0]); close(fds[1]); close(savedErr); close(savedOut);
-                return;
-            }
-
-            g_pipe_read = fds[0];
-            g_pipe_write = fds[1];   // 保留，不关：管道不会被 EOF
-            g_saved_err = savedErr;
-            g_saved_out = savedOut;
-
-            pthread_t th;
-            pthread_attr_t attr;
-            pthread_attr_init(&attr);
-            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-            pthread_attr_setstacksize(&attr, 512 * 1024);
-            BOOL ok = (pthread_create(&th, &attr, dcl_log_pump, NULL) == 0);
-            pthread_attr_destroy(&attr);
-
-            if (ok) {
-                __sync_fetch_and_or(&g_capture_ok, 1);
-            } else {
-                dcl_restore_original_streams();
-                close(g_pipe_read); g_pipe_read = -1;
-                close(g_pipe_write); g_pipe_write = -1;
-            }
-        } @catch (id e) {
-            (void)e;
+        int savedErr = dup(STDERR_FILENO);
+        int savedOut = dup(STDOUT_FILENO);
+        if (dup2(fds[1], STDERR_FILENO) < 0) {
+            close(fds[0]); close(fds[1]); close(savedErr); close(savedOut);
+            return NO;
         }
-    });
+        if (dup2(fds[1], STDOUT_FILENO) < 0) {
+            dup2(savedErr, STDERR_FILENO);
+            close(fds[0]); close(fds[1]); close(savedErr); close(savedOut);
+            return NO;
+        }
+
+        g_pipe_read = fds[0];
+        g_pipe_write = fds[1];   // 保留，不关：管道不会被 EOF
+        g_saved_err = savedErr;
+        g_saved_out = savedOut;
+
+        pthread_t th;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&attr, 512 * 1024);
+        // 读端 fd 随参带进泵里（理由见 dcl_log_pump 开头），不让它回头读全局。
+        BOOL ok = (pthread_create(&th, &attr, dcl_log_pump,
+                                  (void *)(intptr_t)fds[0]) == 0);
+        pthread_attr_destroy(&attr);
+
+        if (ok) {
+            __sync_fetch_and_or(&g_capture_ok, 1);
+            return YES;
+        }
+        dcl_restore_original_streams();
+        close(g_pipe_read); g_pipe_read = -1;
+        close(g_pipe_write); g_pipe_write = -1;
+        return NO;
+    } @catch (id e) {
+        (void)e;
+        return NO;
+    }
+}
+
++ (void)installStderrCapture {
+    pthread_mutex_lock(&g_capture_lock);
+    if (g_pump_stop || g_capture_ok) {           // 已归零 / 已接管，都不再动
+        pthread_mutex_unlock(&g_capture_lock);
+        return;
+    }
+    dcl_attach_capture_locked();
+    pthread_mutex_unlock(&g_capture_lock);
+}
+
++ (void)stopStderrCapture {
+    pthread_mutex_lock(&g_capture_lock);
+    if (g_capture_ok) {
+        // 先立停止标志，再动 fd：泵线程下一轮就会自己退出。
+        g_pump_stop = 1;
+
+        // 归还通道必须排在关写端之前 —— 收不回 stderr 是不可逆的致盲。
+        dcl_restore_original_streams();
+
+        // 关写端，让阻塞在 read 上的泵拿到 EOF（0），从而干净退出而不是被硬杀。
+        if (g_pipe_write >= 0) { close(g_pipe_write); g_pipe_write = -1; }
+        g_pipe_read = -1;                        // 读端由泵自己 close（见 dcl_log_pump 末尾）
+        __sync_fetch_and_and(&g_capture_ok, 0);
+    }
+    pthread_mutex_unlock(&g_capture_lock);
 }
 
 + (BOOL)stderrCaptureInstalled {
     return g_capture_ok != 0;
+}
+
++ (void)setLoggingEnabled:(BOOL)enabled {
+    g_logging_enabled = enabled ? 1 : 0;
 }
 
 + (NSUInteger)runtimeLogMaxBytes {
@@ -585,6 +635,7 @@ static void *dcl_log_pump(void *ctx) {
 
 + (void)appendRuntimeLine:(NSString *)line {
     if (!line) return;
+    if (!g_logging_enabled) return;   // 总开关 off：一个字节都不再往里写
     NSString *captured = [line copy];
     dispatch_async(dcl_log_queue(), ^{
         @autoreleasepool {
@@ -603,6 +654,7 @@ static void *dcl_log_pump(void *ctx) {
 /// 完全没有必要为它们各自排一次队。
 + (void)appendRuntimeLines:(NSArray<NSString *> *)lines {
     if (lines.count == 0) return;
+    if (!g_logging_enabled) return;
     NSArray<NSString *> *captured = [lines copy];
     dispatch_async(dcl_log_queue(), ^{
         @autoreleasepool {

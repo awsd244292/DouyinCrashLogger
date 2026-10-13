@@ -149,6 +149,20 @@ static void dcl_sample_once(void) {
     }
 }
 
++ (void)stop {
+    if (!g_rp_started) return;
+    @try {
+        if (g_rp_timer) {
+            dispatch_source_cancel(g_rp_timer);
+            g_rp_timer = NULL;
+        }
+        g_rp_queue = NULL;
+        g_rp_started = 0;   // 允许将来切回 on 时重新 start
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
 + (NSDictionary<NSString *, id> *)previousSessionWatermark {
     if (!g_prev_snapshot) dcl_take_previous_snapshot();
     return g_prev_snapshot;

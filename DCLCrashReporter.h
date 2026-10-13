@@ -40,6 +40,23 @@ typedef NS_ENUM(NSInteger, DCLPreviousExitKind) {
 /// 安装崩溃捕获（信号处理 + OC 异常处理器）。应在 +load / constructor 中尽早调用。
 + (void)install;
 
+/// 总开关 off 时的「彻底归零」：卸掉本模块装的一切东西，
+/// 让进程回到「这个插件从未注入过」的状态（就崩溃捕获而言）。
+///
+/// 逐项还原，缺一项就等于假卸载：
+///   1. 停止自愈巡检定时器 —— 这是最容易漏的一项。它每 15s 夺回一次处理器，
+///      不先停掉的话，刚还原的处理器会在十几秒后又被我们悄悄抢回来，
+///      用户看到的是「关了但好像没关」；
+///   2. 逐个还原 g_old_sa[] 里保存的旧 sigaction；
+///   3. 还原 OC 未捕获异常处理器为接管前那个；
+///   4. 移除通知观察者（截图 / 进后台 / 回前台三个快照触发）；
+///   5. 交还 stderr / stdout 原本的输出通道。
+///
+/// 还原一律遵守「只还原自己的」：动手前先比对当前处理器是否仍是我们装的那个。
+/// 若期间被别的模块顶替过，就原样留着 —— 否则我们这一脚会把宿主的监控链路踩断。
+/// 重复调用安全；卸载后仍可再次 install。
++ (void)uninstall;
+
 /// 启动期清理：保留最近 DCLMaxRetainedLogs 条，删除其余最旧的。非崩溃安全，仅启动时调用。
 + (void)cleanupOldLogs;
 
@@ -89,7 +106,11 @@ typedef NS_ENUM(NSInteger, DCLPreviousExitKind) {
 
 /// 启动低频率（默认 15s）的周期性自愈计时器，自动夺回被顶替的捕获处理器。
 /// 必须在 install 之后调用（建议放在 DCLMain 的延迟主线程块里）；重复调用安全。
+/// 卸载后（总开关 off）再调用可重新启动，故这里刻意不用 dispatch_once。
 + (void)startHandlerSelfHealing;
+
+/// 停止自愈巡检。由 uninstall 调用，一般不必单独调。
++ (void)stopHandlerSelfHealing;
 
 /// 自上次启动以来，OC 异常处理器被夺回的次数（健康自检展示用）。
 + (NSInteger)uncaughtExceptionHealCount;

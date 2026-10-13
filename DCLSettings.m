@@ -19,6 +19,7 @@
 #import "DCLCrashReporter.h"
 #import "DCLPlaybackTracer.h"
 #import "DCLConstants.h"
+#import "DCLMain.h"
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -47,6 +48,7 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
 @interface DCLSettingsViewController : UIViewController
 @property (nonatomic, strong) UITextView *statusView;
 @property (nonatomic, strong) UISwitch *hookSwitch;
+@property (nonatomic, strong) UISwitch *masterSwitch;   ///< 总开关：开 = 停用插件（off 档）
 @property (nonatomic, strong) UIButton *refreshButton;
 @property (nonatomic, strong) UIButton *exportButton;
 @property (nonatomic, strong) UIButton *clearButton;
@@ -361,6 +363,15 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
     self.statusView.layer.cornerRadius = 10;
     self.statusView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
 
+    // 总开关行：开 = 停用整个插件（off 档）。放在最上面 —— 它是紧急出口，
+    // 用户「觉得抖音被这个插件拖慢了」的第一反应就该能一把拉下来。
+    self.masterSwitch = [[UISwitch alloc] init];
+    self.masterSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.masterSwitch addTarget:self
+                          action:@selector(onMasterChanged)
+                forControlEvents:UIControlEventValueChanged];
+    UIView *masterRow = [self switchRowWithTitle:@"停用插件（总开关）" control:self.masterSwitch];
+
     // 显式 Hook 开关行：开 = full（Hook 全开）/ 关 = safe（零 Hook）。
     // 这是「hook ⇄ 0hook」的直观入口，与摇一摇、capture_mode.txt 三选一等效。
     self.hookSwitch = [[UISwitch alloc] init];
@@ -378,7 +389,7 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
                                    action:@selector(clearLogs)];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        self.statusView, hookRow, self.refreshButton,
+        self.statusView, masterRow, hookRow, self.refreshButton,
         self.exportButton, self.clearButton
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -446,13 +457,26 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
 }
 
 - (void)refreshStatus {
+    BOOL off = [DCLConfig isDisabled];
     BOOL hooksOn = [DCLConfig hooksEnabled];
+    self.masterSwitch.on = off;
     self.hookSwitch.on = hooksOn;
+    // 停用状态下 Hook 档位没有意义，置灰免得用户拨了半天发现没反应。
+    self.hookSwitch.enabled = !off;
 
     NSMutableString *s = [NSMutableString string];
     [s appendString:@"DouyinCrashLogger · 崩溃取证\n"];
     [s appendFormat:@"版本：%@\n", DCLPluginVersion];
     [s appendFormat:@"采集方案：%@\n", [DCLConfig profileDisplayName]];
+
+    if (off) {
+        [s appendString:@"\n已停用：崩溃捕获、卡死看门狗、播放钩子、时间线落盘、资源采样\n"
+                        @"与 stderr 接管已全部卸除，日志不再写入任何内容。\n"
+                        @"仍保留：摇一摇与本设置页入口（否则就再也切不回来了）。\n"];
+        self.statusView.text = s;
+        return;
+    }
+
     [s appendFormat:@"方法交换（Hook）：%@\n", hooksOn ? @"开启（full）" : @"关闭（safe · 零 hook）"];
 
     // 配置期望 vs 运行时已挂载：讲清「配置已改，但当前进程是否已换」的差异，
@@ -472,12 +496,41 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
     self.statusView.text = s;
 }
 
+/// 总开关拨动：打开 = 停用整个插件（off 档）。
+///
+/// 与摇一摇走的是同一个编排函数，所以「这里关」和「摇一摇关」的效果逐项一致 ——
+/// 不会出现「设置页关了只关一半」这种事。
+- (void)onMasterChanged {
+    BOOL off = self.masterSwitch.on;
+    [DCLConfig setProfile: off ? DCLCaptureProfileOff : DCLCaptureProfileSafe];
+    [DCLOrchestrator applyCurrentProfile];
+    [self refreshStatus];
+
+    NSString *title = off ? @"插件已停用" : @"插件已启用（基础采集）";
+    NSString *msg = off
+        ? @"崩溃捕获、看门狗、播放钩子与时间线落盘已在本进程内全部卸除，"
+          @"日志停止写入。摇一摇或本页开关可随时切回。"
+        : @"已切回基础采集（safe · 零 Hook）。崩溃捕获与看门狗已重新装回，"
+          @"如需播放调用栈请把下方 Hook 开关打开。";
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:title
+                                            message:msg
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
 /// Hook 开关拨动：直接翻转 safe/full 档位。
 /// 诚实告知：方法交换在抖音启动早期一次性安装，本会话即时生效的是「配置 + 日志显示」，
 /// 真正的 Hook 增减要等下次启动抖音重新评估（详见 DCLMain 延迟安装分支）。
 - (void)onHookChanged {
     BOOL on = self.hookSwitch.on;
     [DCLConfig setProfile: on ? DCLCaptureProfileFull : DCLCaptureProfileSafe];
+    // safe ⇄ full 之间切换也要过一遍编排：safe → full 时播放钩子是在这里即时补装的，
+    // 不必等下次启动。
+    [DCLOrchestrator applyCurrentProfile];
     [self refreshStatus];
 
     NSString *title = on ? @"已切换到 Hook 全开（full）" : @"已切换到 零 Hook（safe）";

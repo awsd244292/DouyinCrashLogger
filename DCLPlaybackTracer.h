@@ -57,6 +57,11 @@ typedef NS_ENUM(NSUInteger, DCLPauseSource) {
 /// 安装探针。延迟执行（绝不在 constructor 阶段），且必须在主线程调用。
 + (void)install;
 
+/// 把所有已挂载的旁路钩子换回原实现（总开关 off 时用）。
+/// g_bindings 里存着每个类、每个方法的原始 IMP，逐个 method_setImplementation 还原即可；
+/// 还原的是「我们装进去之前的那一个」，不是凭空造一个 —— 所以不会打断别的插件的链路。
++ (void)uninstall;
+
 /// 本次会话观测到的暂停/恢复事件（按时间倒序）
 + (NSArray<DCLPauseEvent *> *)recentEvents;
 

@@ -149,6 +149,11 @@ void DCLTimelineEmergencyDump(const char *path) {
 static NSUInteger dcl_tlp_append_new(void) {
     if (!g_main_path) return 0;
 
+    // 总开关 off 之后，仍可能有「已入队但还没跑」的落盘 block 与正在飞的定时回调。
+    // 闸门放在这里而不是每个调用点，是因为入口有四处 —— 分散判定的话迟早漏掉一个，
+    // 然后停用状态下 timeline.log 又开始长。
+    if (!g_tlp_started) return 0;
+
     uint64_t t0 = DCLTimelineMonoNow();
 
     NSUInteger cap = DCL_TL_CAPACITY;
@@ -264,6 +269,22 @@ const char *DCLTimelineCrashDumpPath(void) {
             });
             dispatch_resume(g_tlp_timer);
         }
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
++ (void)stop {
+    if (!g_tlp_started) return;
+    @try {
+        // 先 cancel 再置位：cancel 是幂等的，重复调用安全。
+        // 注意 g_tlp_timer 已 resume 过，直接释放未 cancel 的 source 会触发断言。
+        if (g_tlp_timer) {
+            dispatch_source_cancel(g_tlp_timer);
+            g_tlp_timer = NULL;
+        }
+        g_tlp_queue = NULL;       // 队列本身由系统回收（ARC 下 dispatch 对象自动管理）
+        g_tlp_started = 0;        // 允许将来切回 on 时重新 start
     } @catch (id e) {
         (void)e;
     }

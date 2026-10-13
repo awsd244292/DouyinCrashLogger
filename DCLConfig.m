@@ -43,16 +43,20 @@ static atomic_int dcl_profile_atomic = ATOMIC_VAR_INIT((int)DCLCaptureProfileSaf
 
 /// 默认开关文件内容：带完整说明，用户打开就能改，不用翻文档
 static NSString *dcl_default_mode_file_text(void) {
-    return @"# DouyinCrashLogger 采集方案开关\n"
+    return @"# DouyinCrashLogger 采集方案开关（总开关也在这里）\n"
             "#\n"
             "# safe = A 方案（默认）：零 hook。只抓崩溃、上次退出性质、卡死时长、插件自检。\n"
             "# full = B 方案：hook 全开。在 A 之上额外抓播放暂停调用栈、触摸时间线、\n"
             "#                卡死时主线程栈与全线程冻结快照（日志更全）。\n"
+            "# off  = 总开关关闭：本插件拒绝一切活动 —— 崩溃捕获 / 看门狗 / 播放探针 /\n"
+            "#        时间线落盘 / 资源采样 / stderr 接管 / 日志写入全部不装或立即卸掉。\n"
+            "#        （写 disable / kill / stop / 停用 / 关闭 也是同一个意思）\n"
             "#\n"
             "# 两档下所有钩子均为「原样透传、零吞事件」的旁路观测；\n"
             "# 若只需证明「有没有崩 / 上次是怎么退的」，保持 safe 即可。\n"
             "#\n"
-            "# 也可在 App 内摇一摇直接翻转档位（免文件、免重启，切换后顶部有提示）。\n"
+            "# 也可在 App 内摇一摇循环切换（safe→full→off→safe，免文件、切换后顶部有提示）。\n"
+            "# 注意：切到 off 只保留摇一摇与设置页入口 —— 那是唯一能把你切回来的通道。\n"
             "# 修改后完全退出并重启抖音生效。\n"
             "safe\n";
 }
@@ -69,15 +73,25 @@ static DCLCaptureProfile dcl_parse_mode_text(NSString *text) {
         if ([line hasPrefix:@"#"] || [line hasPrefix:@";"] || [line hasPrefix:@"//"]) continue;
 
         NSString *low = line.lowercaseString;
+        // off 必须排在最前面判定：它跟 safe/full 不是同一维度。
+        // （更早的版本把 off 当成了 safe，于是「关掉」这个语义根本表达不出来 —— 已修。）
+        if ([low isEqualToString:@"off"] ||
+            [low isEqualToString:@"disable"] || [low isEqualToString:@"disabled"] ||
+            [low isEqualToString:@"kill"] || [low isEqualToString:@"stop"] ||
+            [low isEqualToString:@"none"] || [low isEqualToString:@"no"] ||
+            [low containsString:@"停用"] || [low containsString:@"关闭"] ||
+            [low containsString:@"停止"] || [low containsString:@"禁用"]) {
+            return DCLCaptureProfileOff;
+        }
         if ([low isEqualToString:@"full"] || [low isEqualToString:@"b"] ||
             [low isEqualToString:@"1"] || [low isEqualToString:@"on"] ||
             [low isEqualToString:@"yes"] || [low containsString:@"完整"] ||
             [low containsString:@"全量"] || [low containsString:@"full"]) {
             return DCLCaptureProfileFull;
         }
+        // 注意 "0" 与 "1"（full）是成对的写法，仍归 safe；"off"/"no" 已归上面的总开关。
         if ([low isEqualToString:@"safe"] || [low isEqualToString:@"a"] ||
-            [low isEqualToString:@"0"] || [low isEqualToString:@"off"] ||
-            [low isEqualToString:@"no"] || [low containsString:@"保守"] ||
+            [low isEqualToString:@"0"] || [low containsString:@"保守"] ||
             [low containsString:@"safe"]) {
             return DCLCaptureProfileSafe;
         }
@@ -133,13 +147,23 @@ static DCLCaptureProfile dcl_read_profile(void) {
 
 #pragma mark - 热切换（即时生效）
 
+/// 档位 -> 落盘的文本（三态）
+static NSString *dcl_profile_text(DCLCaptureProfile p) {
+    switch (p) {
+        case DCLCaptureProfileFull: return @"full\n";
+        case DCLCaptureProfileOff:  return @"off\n";
+        case DCLCaptureProfileSafe: return @"safe\n";
+    }
+    return @"safe\n";
+}
+
 + (void)setProfile:(DCLCaptureProfile)profile {
     // 先翻原子值：此后所有 captureProfile 调用立即见到新值，无需重启
     atomic_store(&dcl_profile_atomic, (int)profile);
     @try {
         // 双写持久层：NSUserDefaults（备选通道）+ capture_mode.txt（优先通道），
         // 保证完全退出重启抖音后依然保持本次选择。
-        NSString *text = (profile == DCLCaptureProfileFull) ? @"full\n" : @"safe\n";
+        NSString *text = dcl_profile_text(profile);
         NSString *path = [self modeFilePath];
         NSFileManager *fm = [NSFileManager defaultManager];
         [fm createDirectoryAtPath:[path stringByDeletingLastPathComponent]
@@ -148,7 +172,8 @@ static DCLCaptureProfile dcl_read_profile(void) {
                                     error:nil];
         [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        NSString *v = (profile == DCLCaptureProfileFull) ? @"full" : @"safe";
+        NSString *v = [dcl_profile_text(profile) stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
         [[NSUserDefaults standardUserDefaults] setObject:v forKey:DCLCaptureModeDefaultsKey];
     } @catch (id e) {
         (void)e;
@@ -156,20 +181,41 @@ static DCLCaptureProfile dcl_read_profile(void) {
 }
 
 + (void)toggleProfile {
+    // 三态循环：safe → full → off → safe。
+    // 顺序有讲究：从最常用的 safe 出发，先给更全的档位，最后才到「彻底停用」，
+    // 免得手一抖就从「开」摇到「关」还以为插件坏了。
     DCLCaptureProfile cur = [self captureProfile];
-    [self setProfile:(cur == DCLCaptureProfileFull ? DCLCaptureProfileSafe : DCLCaptureProfileFull)];
+    DCLCaptureProfile next;
+    switch (cur) {
+        case DCLCaptureProfileSafe: next = DCLCaptureProfileFull; break;
+        case DCLCaptureProfileFull: next = DCLCaptureProfileOff;  break;
+        case DCLCaptureProfileOff:  next = DCLCaptureProfileSafe; break;
+    }
+    [self setProfile:next];
 }
 
 #pragma mark - 能力矩阵
 
++ (BOOL)isDisabled {
+    return [self captureProfile] == DCLCaptureProfileOff;
+}
+
 + (NSString *)profileName {
-    return ([self captureProfile] == DCLCaptureProfileFull) ? @"full" : @"safe";
+    switch ([self captureProfile]) {
+        case DCLCaptureProfileFull: return @"full";
+        case DCLCaptureProfileOff:  return @"off";
+        case DCLCaptureProfileSafe: return @"safe";
+    }
+    return @"safe";
 }
 
 + (NSString *)profileDisplayName {
-    return ([self captureProfile] == DCLCaptureProfileFull)
-        ? @"B 方案（full，hook 全开 · 日志更全）"
-        : @"A 方案（safe，零 hook · 默认）";
+    switch ([self captureProfile]) {
+        case DCLCaptureProfileFull: return @"B 方案（full，hook 全开 · 日志更全）";
+        case DCLCaptureProfileOff:  return @"已停用（off · 本插件零活动）";
+        case DCLCaptureProfileSafe: return @"A 方案（safe，零 hook · 默认）";
+    }
+    return @"A 方案（safe，零 hook · 默认）";
 }
 
 + (BOOL)hooksEnabled {
@@ -181,6 +227,9 @@ static DCLCaptureProfile dcl_read_profile(void) {
 }
 
 + (NSArray<NSString *> *)enabledCapabilities {
+    if ([self isDisabled]) {
+        return @[@"（总开关 off：本插件当前不采集、不写盘、不接管 stderr，仅保留摇一摇与入口）"];
+    }
     NSMutableArray *a = [NSMutableArray array];
     [a addObject:@"崩溃信号捕获（SIGABRT/SEGV/BUS/TRAP/ILL/FPE/PIPE）"];
     [a addObject:@"OC 未捕获异常捕获（NSUncaughtExceptionHandler）"];
@@ -201,6 +250,10 @@ static DCLCaptureProfile dcl_read_profile(void) {
 }
 
 + (NSArray<NSString *> *)disabledCapabilities {
+    if ([self isDisabled]) {
+        return @[@"总开关 off —— 所有能力均未启用（崩溃捕获、看门狗、播放探针、时间线、资源采样全部未安装）",
+                 @"摇一摇切换与设置页入口仍在：那是唯一能把总开关切回来的通道"];
+    }
     if ([self captureProfile] == DCLCaptureProfileFull) {
         return @[@"无（已是最高采集档位）"];
     }
@@ -214,8 +267,9 @@ static DCLCaptureProfile dcl_read_profile(void) {
 
 + (NSString *)switchGuide {
     return [NSString stringWithFormat:
-            @"编辑沙盒内 %@/%@，内容写 full 或 safe（# 开头的注释行会被忽略），"
-            @"完全退出并重启抖音生效。当前生效值：%@。",
+            @"编辑沙盒内 %@/%@，内容写 safe / full / off（# 开头的注释行会被忽略；"
+            @"写 disable / kill / 停用 / 关闭 等同于 off），完全退出并重启抖音生效。"
+            @"也可在 App 内摇一摇循环切换（safe→full→off→safe）。当前生效值：%@。",
             DCLCrashLogsRelativeDir, DCLCaptureModeFileName, [self profileName]];
 }
 

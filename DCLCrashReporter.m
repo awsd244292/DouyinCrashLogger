@@ -698,16 +698,24 @@ static void dcl_prepare_meta(void) {
     return g_signal_heal_count;
 }
 
+/// 自愈定时器的句柄。必须留下来 —— 总开关 off 时若不 cancel 它，
+/// 巡检会每 15s 把刚还原的处理器再夺回去，用户看到的就成了「关了但没真关」。
+/// 同理，这里不用 dispatch_once：卸载后用户可能又切回来，那时得能重新起。
+static dispatch_source_t g_selfheal_timer = NULL;
+static volatile int g_selfheal_running = 0;
+
 /// 低频率周期巡检：自动夺回被顶替的捕获处理器。靠「最后写入者胜出」这个事实，
 /// 即便某个共存模块也周期性地抢，我们只要在崩溃发生前的某次巡检里赢一次，
 /// OC 异常 / 致命信号就能回到我们的捕获链路里。
 + (void)startHandlerSelfHealing {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
+    // 用 CAS 取代 dispatch_once：off → on 切换时要能重新起，once 是条单行道。
+    if (!__sync_bool_compare_and_swap(&g_selfheal_running, 0, 1)) return;
+
+    @try {
         dispatch_queue_t q = dispatch_queue_create("com.dcl.selfheal", DISPATCH_QUEUE_SERIAL);
         dispatch_source_t timer = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-        if (!timer) return;
+        if (!timer) { g_selfheal_running = 0; return; }
         // 首保 5s 后启动，之后每 15s 巡检一次：足以抓住绝大多数「装完又被抢」，
         // 又低频到对宿主 RunLoop 无感知。
         uint64_t start    = (uint64_t)(5  * NSEC_PER_SEC);
@@ -717,12 +725,25 @@ static void dcl_prepare_meta(void) {
                                   interval, (uint64_t)(5 * NSEC_PER_SEC));
         dispatch_source_set_event_handler(timer, ^{
             @try {
+                if (!g_selfheal_running) return;   // 已被卸载，别再抢
                 [self healUncaughtExceptionHandlerIfNeeded];
                 [self healSignalHandlersIfNeeded];
             } @catch (id e) { (void)e; }
         });
+        g_selfheal_timer = timer;
         dispatch_resume(timer);
-    });
+    } @catch (id e) {
+        (void)e;
+        g_selfheal_running = 0;
+    }
+}
+
+/// 停止自愈巡检并释放定时器。必须在还原处理器「之前」调用，顺序反了等于白还原。
++ (void)stopHandlerSelfHealing {
+    if (!__sync_bool_compare_and_swap(&g_selfheal_running, 1, 0)) return;
+    dispatch_source_t t = g_selfheal_timer;
+    g_selfheal_timer = NULL;
+    if (t) dispatch_source_cancel(t);   // cancel 由系统完成收尾释放，不去碰已 cancel 的源
 }
 
 #pragma mark - 目录
@@ -776,6 +797,59 @@ static void dcl_prepare_meta(void) {
         g_prev_uncaught = NSGetUncaughtExceptionHandler();
         NSSetUncaughtExceptionHandler(&dcl_uncaught_exception_handler);
     } @catch (id e) { (void)e; }
+}
+
+/// 逐个还原信号处理器，但只还原「当前仍是我们装的」那些。
+///
+/// 为什么必须比对：从 install 到卸载之间，别的高权限模块可能已经顶替过我们的处理器。
+/// 那时候 g_old_sa[] 里存的是「它装之前的」，我们照抄回去，等于替别人拆了别人的链路
+/// —— 而崩溃监控这种东西被拆掉是静默的，没人会报错，只在真崩的那一次才发现没记录。
+/// 所以：不是我们的就不碰。
+static void dcl_restore_signals(void) {
+    for (size_t i = 0; i < sizeof(dcl_monitored_signals) / sizeof(dcl_monitored_signals[0]); i++) {
+        int sig = dcl_monitored_signals[i];
+        if (!g_old_sa_valid[sig]) continue;
+
+        struct sigaction cur;
+        memset(&cur, 0, sizeof(cur));
+        if (sigaction(sig, NULL, &cur) != 0) continue;
+        if (cur.sa_sigaction != dcl_signal_handler) continue;   // 已被别人接管，原样留着
+
+        sigaction(sig, &g_old_sa[sig], NULL);
+        g_old_sa_valid[sig] = 0;
+    }
+}
+
+/// 还原 OC 未捕获异常处理器，同样是「只还原自己的」。
+static void dcl_restore_uncaught_handler(void) {
+    NSUncaughtExceptionHandler *cur = NSGetUncaughtExceptionHandler();
+    if (cur != dcl_uncaught_exception_handler) return;   // 有人接手了，不抢
+    // g_prev_uncaught 为 NULL 表示接管前宿主没装，那就还原成默认（传 NULL 正是这个语义）。
+    NSSetUncaughtExceptionHandler(g_prev_uncaught);
+    g_prev_uncaught = NULL;
+}
+
++ (void)uninstall {
+    // 顺序要紧：自愈巡检是个每 15s 把处理器抢回来的后台环路，先停它再还原。
+    @try { [self stopHandlerSelfHealing]; }      @catch (id e) { (void)e; }
+    @try { dcl_restore_uncaught_handler(); }     @catch (id e) { (void)e; }
+    @try { dcl_restore_signals(); }              @catch (id e) { (void)e; }
+
+    // 只摘三个「快照触发」观察者（截图 / 进后台 / 回前台）—— 它们才是会写盘的采集动作。
+    // 退出性质那三个（WillTerminate / 背景态 / 前台态）刻意保留：它们只写一个 bool 到
+    // NSUserDefaults，代价近乎为零，却是「用户划掉」与「真闪退」唯一的区分依据。
+    // 一并摘掉的话，off 期间正常退出一轮，下次切回 on 就会把它误判成可疑闪退。
+    @try {
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        [nc removeObserver:self name:UIApplicationUserDidTakeScreenshotNotification object:nil];
+        [nc removeObserver:self name:UIApplicationDidEnterBackgroundNotification      object:nil];
+        [nc removeObserver:self name:UIApplicationWillEnterForegroundNotification     object:nil];
+    } @catch (id e) { (void)e; }
+
+    // 把 stderr / stdout 还给宿主。这一项漏了就不可逆：宿主的输出被永久吞掉。
+    @try { [DCLLogger stopStderrCapture]; }      @catch (id e) { (void)e; }
+
+    g_installed = 0;   // 允许再次 install（用户从 off 切回来时要走这条路）
 }
 
 #pragma mark - 退出标记 / 运行时日志
@@ -1383,6 +1457,11 @@ static dispatch_queue_t dcl_snapshot_queue(void) {
 }
 
 + (void)writeLatestLogWithReason:(NSString *)reason {
+    // 总开关 off：任何来源（设置页手动刷新、截图、进后台）一律拒绝写盘。
+    // 闸门放在这里而不是每个调用点，是因为「不写」这件事只该有一条判据 ——
+    // 分散到各处迟早会漏掉某一个触发器，然后日志就又开始长了。
+    if ([DCLConfig isDisabled]) return;
+
     // 进后台这一路必须同步落盘：App 随时会在此之后被挂起甚至杀死，
     // 走异步很可能只写了一半就被冻结 —— 那这份日志等于没有。
     BOOL mustBeSync = ([reason rangeOfString:@"后台"].location != NSNotFound);

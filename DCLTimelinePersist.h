@@ -40,6 +40,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// 反而把 IO 次数和耗电都堆上去了 —— 探针自己不该成为负担。
 + (void)startWithDirectory:(NSString *)directory;
 
+/// 停止周期落盘并释放持有的队列/定时器（总开关 off 时用）。
+/// 停掉之后不再产生任何磁盘写入；已落盘的 timeline.log 保持原样，不删。
++ (void)stop;
+
 /// 立即把尚未落盘的条目追加下去（生成 latest.log 前调一次，保证报告是最新的）
 + (void)flushNow;
 

@@ -87,6 +87,7 @@ static volatile uint64_t g_last_touch_us = 0;          // 最近一次触摸事�
 static volatile uint64_t g_watchdog_alive_us = 0;      // watchdog 自身心跳（自证活着）
 static volatile int32_t g_backgrounded = 0;            // App 是否在后台
 static volatile int32_t g_installed = 0;
+static volatile int32_t g_wd_stop = 0;         // 总开关 off 时置 1，让后台线程退出循环
 
 static thread_t g_main_thread = MACH_PORT_NULL;
 static CFRunLoopObserverRef g_loop_observer = NULL;
@@ -406,6 +407,7 @@ static void dcl_watchdog_main(void) {
     NSArray<NSString *> *lastStack = nil;
 
     for (;;) {
+        if (g_wd_stop) break;          // 总开关 off：收工，让线程自然退出
         g_watchdog_alive_us = DCLNowUs();
         usleep(kPollIntervalUs);
 
@@ -497,6 +499,7 @@ static void dcl_watchdog_main(void) {
     if (![NSThread isMainThread]) return;
     if (__sync_fetch_and_or(&g_installed, 1)) return;
     @try {
+        g_wd_stop = 0;   // 上一次 uninstall 若置过停止标志，这里必须复位，否则线程一起就退
         g_main_thread = mach_thread_self();
         g_main_heartbeat_us = DCLNowUs();
         g_stalls = [NSMutableArray array];
@@ -518,6 +521,31 @@ static void dcl_watchdog_main(void) {
         g_watchdog_thread.qualityOfService = NSQualityOfServiceBackground;
         g_watchdog_alive_us = DCLNowUs();
         [g_watchdog_thread start];
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
++ (void)uninstall {
+    @try {
+        // 顺序：先立停止标志（线程下一轮就退），再摘观察者，最后清内存。
+        // 反过来先摘观察者的话，心跳时间戳会停在最后那一刻，
+        // 线程里 if (hb == 0) 之外还可能误判一次卡顿。
+        __sync_fetch_and_or(&g_wd_stop, 1);
+
+        if (g_loop_observer) {
+            CFRunLoopRemoveObserver(CFRunLoopGetMain(), g_loop_observer, kCFRunLoopCommonModes);
+            CFRelease(g_loop_observer);
+            g_loop_observer = NULL;
+        }
+        pthread_mutex_lock(&g_stalls_lock);
+        [g_stalls removeAllObjects];
+        pthread_mutex_unlock(&g_stalls_lock);
+
+        g_main_heartbeat_us = 0;
+        g_last_activity = 0;
+        g_watchdog_alive_us = 0;
+        g_installed = 0;   // 允许将来切回 on 时重新 install
     } @catch (id e) {
         (void)e;
     }

@@ -20,6 +20,10 @@
 static volatile int32_t g_ss_installed = 0;
 static volatile uint32_t g_ss_count = 0;
 static NSArray<NSString *> *g_av_subclasses = nil;
+/// addObserverForName:...usingBlock: 返回的 token。想精确移除，只能靠它 ——
+/// 拿名字去 removeObserver:name:object: 是移不掉 block 型观察者的，
+/// 所以装的时候就得把 token 攒着。
+static NSMutableArray *g_ss_tokens = nil;
 
 #pragma mark - 辅助
 
@@ -150,19 +154,22 @@ static void dcl_ss_memory(NSNotification *n) {
 
     @try {
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        if (!g_ss_tokens) g_ss_tokens = [NSMutableArray array];
 
         // —— 音频会话：系统打断的最直接证据 ——
         if (NSClassFromString(@"AVAudioSession")) {
-            [nc addObserverForName:AVAudioSessionInterruptionNotification
-                            object:nil
-                             queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *n) { dcl_ss_audio_interrupt(n); }];
+            id t1 = [nc addObserverForName:AVAudioSessionInterruptionNotification
+                                    object:nil
+                                     queue:[NSOperationQueue mainQueue]
+                                usingBlock:^(NSNotification *n) { dcl_ss_audio_interrupt(n); }];
+            if (t1) [g_ss_tokens addObject:t1];
             g_ss_count++;
 
-            [nc addObserverForName:AVAudioSessionRouteChangeNotification
-                            object:nil
-                             queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *n) { dcl_ss_route_change(n); }];
+            id t2 = [nc addObserverForName:AVAudioSessionRouteChangeNotification
+                                    object:nil
+                                     queue:[NSOperationQueue mainQueue]
+                                usingBlock:^(NSNotification *n) { dcl_ss_route_change(n); }];
+            if (t2) [g_ss_tokens addObject:t2];
             g_ss_count++;
         }
 
@@ -185,16 +192,31 @@ static void dcl_ss_memory(NSNotification *n) {
             //（clang: cannot refer to declaration with an array type inside block），
             // 而 pairs[i].fn 的求值路径要经过数组。取出来之后捕获的是普通指针，合法。
             void (*fn)(NSNotification *) = pairs[i].fn;
-            [nc addObserverForName:pairs[i].name
-                            object:nil
-                             queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *n) { if (fn) fn(n); }];
+            id tok = [nc addObserverForName:pairs[i].name
+                                     object:nil
+                                      queue:[NSOperationQueue mainQueue]
+                                 usingBlock:^(NSNotification *n) { if (fn) fn(n); }];
+            if (tok) [g_ss_tokens addObject:tok];
             g_ss_count++;
         }
 
         // —— 只读 runtime 摸底：抖音有没有基于 AVPlayer 的自研播放器 ——
         // 结果不写时间线（它不是事件而是事实），由 signalSummary 输出进日志。
         (void)[self avPlayerSubclasses];
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
++ (void)uninstall {
+    @try {
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        for (id tok in g_ss_tokens) {
+            [nc removeObserver:tok];
+        }
+        [g_ss_tokens removeAllObjects];
+        g_ss_count = 0;
+        g_ss_installed = 0;   // 允许将来切回 on 时重新 install
     } @catch (id e) {
         (void)e;
     }

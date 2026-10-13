@@ -547,6 +547,70 @@ static void dcl_schedule_retry(int attempt) {
     }
 }
 
+/// 把某一个类上挂过的钩子还原。返回还原成功的个数。
+static NSUInteger dcl_unhook_class(DCLPlayerBinding *b) {
+    if (!b || !b->cls) return 0;
+    NSUInteger n = 0;
+    struct { SEL sel; void *orig; } pairs[] = {
+        { @selector(pause),                            b->orig_pause        },
+        { @selector(play),                             b->orig_play         },
+        { @selector(setRate:),                         b->orig_setRate      },
+        { @selector(replaceCurrentItemWithPlayerItem:), b->orig_replaceItem  },
+        { @selector(initWithPlayerItem:),              b->orig_initWithItem },
+        { @selector(initWithURL:),                     b->orig_initWithURL  },
+    };
+    for (NSUInteger i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        if (!pairs[i].orig) continue;
+        Method m = class_getInstanceMethod(b->cls, pairs[i].sel);
+        if (!m) continue;
+        // 只在我们仍占据这个实现时才还原：若中途被别的插件换过，
+        // 盲还原等于替别人做决定 —— 那种情况下宁可留着（它已经是别人的了）。
+        IMP cur = method_getImplementation(m);
+        if (cur == (IMP)dcl_pause || cur == (IMP)dcl_play || cur == (IMP)dcl_setRate ||
+            cur == (IMP)dcl_replaceItem || cur == (IMP)dcl_initWithItem || cur == (IMP)dcl_initWithURL) {
+            method_setImplementation(m, (IMP)pairs[i].orig);
+            n++;
+        }
+    }
+    return n;
+}
+
++ (void)uninstall {
+    if (!g_installed) return;
+    @try {
+        int32_t n = g_binding_count;
+        for (int32_t i = 0; i < n; i++) {
+            dcl_unhook_class(&g_bindings[i]);
+        }
+        // sendEvent: 单独挂在「真正实现它的那一层」上，走同一套「只还原自己的」判断
+        Class appRootCls = NSClassFromString(@"UIApplication");
+        id app = (appRootCls && [appRootCls respondsToSelector:@selector(sharedApplication)])
+                 ? [appRootCls sharedApplication] : nil;
+        Class eventOwner = DCLMostDerivedMethodOwner(app, @selector(sendEvent:), appRootCls)
+                           ?: appRootCls;
+        if (eventOwner && dcl_orig_sendEvent_fn) {
+            Method m = class_getInstanceMethod(eventOwner, @selector(sendEvent:));
+            if (m && method_getImplementation(m) == (IMP)dcl_sendEvent) {
+                method_setImplementation(m, (IMP)dcl_orig_sendEvent_fn);
+            }
+        }
+        dcl_orig_sendEvent_fn = NULL;
+
+        if (g_events_lock) {
+            @synchronized (g_events_lock) {
+                [g_events removeAllObjects];
+                [g_skipped removeAllObjects];
+            }
+        }
+        memset(g_bindings, 0, sizeof(g_bindings));
+        g_binding_count = 0;
+        g_hook_count = 0;
+        g_installed = 0;   // 允许将来切回 full 时重新 install
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
 + (NSArray<DCLPauseEvent *> *)recentEvents {
     @synchronized (g_events_lock) {
         return [[g_events reverseObjectEnumerator] allObjects] ?: @[];

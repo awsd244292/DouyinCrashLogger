@@ -32,6 +32,7 @@
 #import "DCLConfig.h"
 #import "DCLSupport.h"
 #import "DCLLogger.h"
+#import "DCLMain.h"
 
 #import <AudioToolbox/AudioToolbox.h>
 #import <UIKit/UIKit.h>
@@ -218,7 +219,10 @@ static void dcl_hs_show_toast(NSString *title, NSString *subtitle) {
 /// 把翻转后的档位「说清楚」：用户要的是知道现在到底是哪一档、多了什么能力。
 static void dcl_hs_announce(DCLCaptureProfile profile) {
     NSString *title = nil, *subtitle = nil;
-    if (profile == DCLCaptureProfileFull) {
+    if (profile == DCLCaptureProfileOff) {
+        title = @"采集档位：已停用";
+        subtitle = @"崩溃捕获与全部钩子已卸除 · 摇一摇可切回";
+    } else if (profile == DCLCaptureProfileFull) {
         title = @"采集档位：完整采集";
         subtitle = @"播放/触摸归因 · 卡死栈取证 已开启";
     } else {
@@ -226,6 +230,15 @@ static void dcl_hs_announce(DCLCaptureProfile profile) {
         subtitle = @"仅崩溃与退出取证 · 零 hook";
     }
     dcl_hs_show_toast(title, subtitle);
+}
+
+/// 三态代号（日志与 toast 共用）。写成一个函数，免得三处各拼一遍字符串而拼出三种写法。
+static NSString *dcl_hs_profile_name(DCLCaptureProfile p) {
+    switch (p) {
+        case DCLCaptureProfileOff:  return @"off";
+        case DCLCaptureProfileFull: return @"full";
+        default:                    return @"safe";
+    }
 }
 
 #pragma mark - 摇一摇判定
@@ -268,11 +281,17 @@ static void dcl_hs_sendEvent(id self, SEL _cmd, UIEvent *event) {
 
                 // 留痕：提示没弹出来或关了震动时，这是唯一能确认「确实翻过了」的出口。
                 // 注意 appendRuntimeLine 会把非 ASCII 转义，故日志行一律英文。
+                // 这一行必须写在 applyCurrentProfile 之前 —— 切到 off 时日志闸门会关上，
+                // 之后再写的任何东西都落不了盘。
                 [DCLLogger appendRuntimeLine:
                  [NSString stringWithFormat:@"[DCL] hotswitch: shake -> %@ -> %@ (hooks %@)",
-                  (before == DCLCaptureProfileFull ? @"full" : @"safe"),
-                  (after == DCLCaptureProfileFull ? @"full" : @"safe"),
+                  dcl_hs_profile_name(before),
+                  dcl_hs_profile_name(after),
                   (after == DCLCaptureProfileFull ? @"ON" : @"OFF")]];
+
+                // 真正生效的一步：切到 off 就卸干净，切回 safe/full 就装回来。
+                // 摇一摇本身与设置页入口不在卸载范围内，所以永远还能再摇一次。
+                [DCLOrchestrator applyCurrentProfile];
             }
         }
     } @catch (id e) {
