@@ -42,6 +42,7 @@
 #import "DCLSystemSignal.h"
 #import "DCLTimelinePersist.h"
 #import "DCLResourceProbe.h"
+#import "DCLSettings.h"
 
 __attribute__((constructor)) static void dcl_entry(void) {
     @try {
@@ -100,6 +101,11 @@ __attribute__((constructor)) static void dcl_entry(void) {
             if ([DCLConfig hooksEnabled]) {
                 [DCLPlaybackTracer install];
             }
+
+            // 设置入口接入 DYStorage：仅在 DYStorage 已安装时注册一个菜单项，
+            // 由它统一渲染与派发点击，本插件不自己 Hook 抖音设置页 —— 避免多插件
+            // 共存时重复 swizzle 设置 VC 互相踩踏。未安装则静默跳过（保持纯后台）。
+            [DCLSettings registerEntry];
 
             // 启动标记 / 上次退出性质：必须在沙盒就绪、runloop 启动后才写 runtime 日志，
             // 否则 constructor 阶段 NSHomeDirectory 未就位 / GCD 异步块未调度 → 写入落空。

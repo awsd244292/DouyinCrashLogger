@@ -37,7 +37,9 @@ if [[ ! -d "$SDK_SYSROOT" ]]; then
 fi
 
 FILES=(DCLMain.m DCLConstants.m DCLCrashReporter.m DCLWatchdog.m DCLPlaybackTracer.m
-       DCLHealthCheck.m DCLConfig.m DCLHotSwitch.m DCLLogger.m DCLSupport.m)
+       DCLHealthCheck.m DCLConfig.m DCLHotSwitch.m DCLLogger.m DCLSupport.m
+       DCLTimeline.m DCLSystemSignal.m DCLTimelinePersist.m DCLResourceProbe.m
+       DCLProbeCost.m DCLSettings.m)
 
 echo "==> 语法预检（真 SDK, $CC, min iOS $MIN_IOS）"
 fail=0
