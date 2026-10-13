@@ -49,8 +49,11 @@
 > **设置面板形态 = Bottom Sheet（上滑出场 + 毛玻璃）**：
 >   · 走 iOS 15+ 原生 `UISheetPresentationController`（detents 中/大、顶部 grabber、20pt 圆角），
 >     **上滑进场 / 下滑手势关闭 / 阻尼手感全部由系统负责**，不是自绘；
->     （抖音当前 App Store 已要求 iOS 15+，dylib 实际只在 ≥15 运行，
->      `min=14.0` 是为旧 IPA 留的后路，代码用 `@available` 守卫后回退 PageSheet。）
+>     · 部署目标已从 14.0 提到 **15.0**（抖音当前 App Store 本就要求 15.0+），构建 SDK 同步换成
+>       **iPhoneOS16.5**（14.5 的头文件里压根没有 iOS 15 的 sheet API）。连带把 `@available` 全去掉了：
+>       16.5 SDK 下它会编译成 `__isPlatformVersionAtLeast` 调用，而 theos 精简 SDK 的
+>       `libSystem.B.tbd` 没导出这个符号，链接期必挂；部署目标抬到 15.0 后编译器把
+>       `@available(iOS ≤15)` 判为恒真、不再生成该调用，问题从根上消失。
 >   · 毛玻璃由面板自身最底层的 `UIVisualEffectView`（`.systemThickMaterial`）实现，
 >     实时采样下层抖音界面 → 真 frosted glass；导航栏用 `configureWithTransparentBackground`
 >     置透明，避免顶部不透明白条把模糊「截胡」。
