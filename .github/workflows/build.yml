@@ -68,6 +68,14 @@ jobs:
     needs: changes
     if: needs.changes.outputs.should_build == 'true'
     runs-on: ubuntu-latest
+    # 为什么不再用 iPhoneOS14.5.sdk：
+    # 面板 iOS 15+ 的 Bottom Sheet（UISheetPresentationController）在 14.5 头文件里根本不存在，
+    # 编译直接报 property / class 找不到。部署目标（MIN_IOS）与 SDK 版本是两码事 ——
+    # 低目标 + 高 SDK 恰恰是 Apple 推荐的组合：带的还是 14.0 的门禁，但能看到全部可用 API，
+    # 运行时该走的 @available 分支一条没少。
+    env:
+      SDK_VERSION: iPhoneOS16.5.sdk
+      MIN_IOS: "14.0"
 
     steps:
       - uses: actions/checkout@v6
