@@ -225,7 +225,12 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
 /// 找当前 keyWindow 的最上层已 present 的 VC（兼容 iOS 13+ 多 scene）。
 + (nullable UIViewController *)topViewController {
     UIWindow *window = nil;
-    if (@available(iOS 13.0, *)) {
+    // iOS 13+ 起 UIWindow 归属于 UIWindowScene，只能按 scene 遍历去找 keyWindow。
+    // 这里刻意不再写 @available(iOS 13.0, *)：部署目标已是 15.0（见 workflow 的 MIN_IOS），
+    // 条件恒真；更硬的理由是 iPhoneOS16.5 SDK 下 @available 会编译成
+    // __isPlatformVersionAtLeast 调用，而 theos 精简 SDK 的 libSystem 并未导出这个符号，
+    // 链接期直接 undefined symbol —— 真编译跑一次就挂在那儿。
+    {
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
             UIWindowScene *ws = (UIWindowScene *)scene;
@@ -241,11 +246,6 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
                 if (ws.count) { window = ws.firstObject; break; }
             }
         }
-    } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        window = [UIApplication sharedApplication].keyWindow;
-#pragma clang diagnostic pop
     }
     if (!window) return nil;
 
@@ -266,32 +266,38 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
             [[UINavigationController alloc] initWithRootViewController:panel];
 
         // 导航栏透明：否则顶部一条不透明白条会把毛玻璃「截胡」，面板看着像被切了头。
-        if (@available(iOS 13.0, *)) {
-            UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
-            [appearance configureWithTransparentBackground];
-            nav.navigationBar.standardAppearance = appearance;
-            nav.navigationBar.scrollEdgeAppearance = appearance;
-        }
+        // UINavigationBarAppearance 是 iOS 13+ API，部署目标 15.0 下可直接用。
+        UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+        [appearance configureWithTransparentBackground];
+        nav.navigationBar.standardAppearance = appearance;
+        nav.navigationBar.scrollEdgeAppearance = appearance;
 
-        // Bottom Sheet：iOS 15+ 走原生 UISheetPresentationController，顺势白拿
-        //   上滑进场动画 / 顶部把手 grabber / 下滑手势关闭 / 系统阻尼手感。
-        // 抖音当前 App Store 已要求 iOS 15+，故这分支是实际主路径；
-        // iOS 14 及以下（理论上跑不动新版抖音，但仍守一手）回退 PageSheet。
+        // Bottom Sheet：iOS 15+ 的原生 UISheetPresentationController，顺势白拿
+        //   上滑进场动画 / 顶部把手 grabber / 下滑手势关闭 / 系统阻尼手感，
+        //   比自己手写一个转场既省事又和抖音自家弹层的手感一致。
+        //   部署目标 15.0 ⇒ 这就是实际主路径；nav 拿不到 sheet 的极端情况才回退 PageSheet。
         BOOL usedSheet = NO;
-        if (@available(iOS 15.0, *)) {
-            UISheetPresentationController *sheet = nav.sheetPresentationController;
-            if (sheet) {
-                NSMutableArray *detents =
-                    [NSMutableArray arrayWithObject:[UISheetPresentationControllerDetent mediumDetent]];
-                if (@available(iOS 16.0, *)) {
-                    [detents addObject:[UISheetPresentationControllerDetent largeDetent]];
-                }
-                sheet.detents = detents;
-                sheet.prefersGrabberVisible = YES;          // 顶部小把手，明示可下滑关闭
-                sheet.preferredCornerRadius = 20.0;
-                sheet.prefersScrollingExpandsWhenScrolledToEdge = YES;
-                usedSheet = YES;
+        UISheetPresentationController *sheet = nav.sheetPresentationController;
+        if (sheet) {
+            NSMutableArray *detents =
+                [NSMutableArray arrayWithObject:[UISheetPresentationControllerDetent mediumDetent]];
+            // largeDetent 是 iOS 16 的，不能直接引用（部署目标 15 会导致 API 判定告警）——
+            // 走 NSClassFromString + selector 动态取，取到就多给一档大尺寸，取不到就只有中档。
+            Class detentCls = NSClassFromString(@"UISheetPresentationControllerDetent");
+            if (detentCls && [detentCls respondsToSelector:NSSelectorFromString(@"largeDetent")]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                // 这里的 selector 返回的是 Detent 的共享实例，不存在泄漏；
+                // 只是编译器看不出selector 名字，会例行发一句警告。
+                id largeDetent = [detentCls performSelector:NSSelectorFromString(@"largeDetent")];
+#pragma clang diagnostic pop
+                if (largeDetent) [detents addObject:largeDetent];
             }
+            sheet.detents = detents;
+            sheet.prefersGrabberVisible = YES;              // 顶部小把手，明示可下滑关闭
+            sheet.preferredCornerRadius = 20.0;
+            sheet.prefersScrollingExpandsWhenScrolledToEdge = YES;
+            usedSheet = YES;
         }
         if (!usedSheet) {
             nav.modalPresentationStyle = UIModalPresentationPageSheet;

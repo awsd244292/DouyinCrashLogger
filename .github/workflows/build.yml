@@ -68,14 +68,19 @@ jobs:
     needs: changes
     if: needs.changes.outputs.should_build == 'true'
     runs-on: ubuntu-latest
-    # 为什么不再用 iPhoneOS14.5.sdk：
-    # 面板 iOS 15+ 的 Bottom Sheet（UISheetPresentationController）在 14.5 头文件里根本不存在，
-    # 编译直接报 property / class 找不到。部署目标（MIN_IOS）与 SDK 版本是两码事 ——
-    # 低目标 + 高 SDK 恰恰是 Apple 推荐的组合：带的还是 14.0 的门禁，但能看到全部可用 API，
-    # 运行时该走的 @available 分支一条没少。
+    # 为什么不再用 iPhoneOS14.5.sdk：面板用的 iOS 15 Bottom Sheet
+    # （UISheetPresentationController / Detent）在 14.5 头文件里根本不存在，编译直接挂。
+    #
+    # 为什么 MIN_IOS 从 14.0 提到 15.0：
+    #   1) 抖音当前 App Store 已要求 iOS 15.0+，14 的门禁保的是一群装不上抖音的设备；
+    #   2) iPhoneOS16.5 SDK 下 @available 会编译成对 __isPlatformVersionAtLeast 的调用，
+    #      而 theos 精简 SDK 的 libSystem.B.tbd 并没有导出这个符号（实测 grep 命中 0 次），
+    #      链接期必报 undefined symbol。部署目标抬到 15.0 后，@available(iOS 15.0 及以下)
+    #      被编译器判为恒真、不再生成该调用 —— 这才是根上的解法，
+    #      比补一个编译器内部符号的自定义实现干净得多。
     env:
       SDK_VERSION: iPhoneOS16.5.sdk
-      MIN_IOS: "14.0"
+      MIN_IOS: "15.0"
 
     steps:
       - uses: actions/checkout@v6

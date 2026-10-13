@@ -99,17 +99,20 @@ static void dcl_hs_feedback(void) {
 static UIWindow *dcl_hs_make_toast_window(void) {
     UIWindow *win = nil;
     @try {
-        if (@available(iOS 13.0, *)) {
-            UIWindowScene *scene = nil;
-            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-                if ([s isKindOfClass:[UIWindowScene class]] &&
-                    s.activationState == UISceneActivationStateForegroundActive) {
-                    scene = (UIWindowScene *)s;
-                    break;
-                }
+        // iOS 13 起 UIWindow 必须挂在某个 UIWindowScene 上才正常显示，故取前台活跃的 scene。
+        // 不再写 @available(iOS 13.0, *)：部署目标 15.0（MIN_IOS）下恒真，
+        // 且 @available 在 iPhoneOS16.5 SDK 下会链接到 libSystem 未导出的
+        // __isPlatformVersionAtLeast —— 详情见 DCLSettings.m 的同批改动说明。
+        // 取不到 scene（宿主尚未装配完 / 极端场景）就走下面的按屏幕 bounds 兜底。
+        UIWindowScene *scene = nil;
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]] &&
+                s.activationState == UISceneActivationStateForegroundActive) {
+                scene = (UIWindowScene *)s;
+                break;
             }
-            if (scene) win = [[UIWindow alloc] initWithWindowScene:scene];
         }
+        if (scene) win = [[UIWindow alloc] initWithWindowScene:scene];
     } @catch (id e) {
         win = nil;
     }
