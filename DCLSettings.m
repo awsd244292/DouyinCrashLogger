@@ -36,7 +36,16 @@ typedef void (^DYStorageAction)(void);
 static NSString *const kDCLStorageIdentifier = @"com.awsd244292.douyincrashlogger";
 static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
 
-@class DCLSettingsViewController;   // 前向声明：presentSettings 在上方引用，避免编译期 unknown class
+// 前置声明必须带父类与成员属性 —— 光给 @class 只能声明「有这么个类」，
+// 不能继承、不能定义类扩展、不能 @implementation（编译器会报 root class / 
+// unknown class）。presentSettings 定义在本文件上半部，需在它之前看到完整接口。
+@interface DCLSettingsViewController : UIViewController
+@property (nonatomic, strong) UITextView *statusView;
+@property (nonatomic, strong) UIButton *profileButton;
+@property (nonatomic, strong) UIButton *refreshButton;
+@property (nonatomic, strong) UIButton *exportButton;
+@property (nonatomic, strong) UIButton *clearButton;
+@end
 
 #pragma mark - DCLSettings
 
@@ -126,13 +135,7 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
 
 #pragma mark - DCLSettingsViewController
 
-@interface DCLSettingsViewController ()
-@property (nonatomic, strong) UITextView *statusView;
-@property (nonatomic, strong) UIButton *profileButton;
-@property (nonatomic, strong) UIButton *refreshButton;
-@property (nonatomic, strong) UIButton *exportButton;
-@property (nonatomic, strong) UIButton *clearButton;
-@end
+// 属性已在文件顶部的前置声明中给出，此处不再重复类扩展。
 
 @implementation DCLSettingsViewController
 
