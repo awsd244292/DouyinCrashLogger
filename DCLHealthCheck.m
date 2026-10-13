@@ -360,8 +360,12 @@
             it.level = DCLHealthLevelPass;
             it.evidence = [NSString stringWithFormat:
                            @"stderr/stdout 已接管（管道+后台泵，写端 O_NONBLOCK）；"
-                           @"当前会话日志 %llu B / 上限 %lu B，上一会话%s",
-                           curSize, (unsigned long)capBytes, prev ? "已轮转为 _prev" : "（首轮无）"];
+                           @"当前会话日志 %llu B / 上限 %lu B，上一会话%s；"
+                           @"已落盘 %lu 行，抽样压掉重复刷屏 %lu 行，剔除系统噪音 %lu 行",
+                           curSize, (unsigned long)capBytes, prev ? "已轮转为 _prev" : "（首轮无）",
+                           (unsigned long)[DCLLogger writtenLineCount],
+                           (unsigned long)[DCLLogger throttledLineCount],
+                           (unsigned long)[DCLLogger noiseDroppedCount]];
         } else if (![DCLLogger stderrCaptureInstalled]) {
             it.level = DCLHealthLevelWarn;
             it.evidence = @"stderr/stdout 未接管（宿主已在重定向或本次注入方式受限）；"

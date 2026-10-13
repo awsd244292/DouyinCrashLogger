@@ -29,6 +29,25 @@ static const NSTimeInterval DCLCrashLogMaxAgeSeconds = 7 * 24 * 60 * 60;
 /// 崩溃日志目录总量闸门：超过就继续删最旧的，直到落到上限以下
 static const unsigned long long DCLCrashLogsTotalCapBytes = 8ULL * 1024 * 1024;
 
+#pragma mark - 降频常量（用真机日志标定，不是拍脑袋）
+
+/// 同一「形态」的行（数字与十六进制地址归一化后相同）前 N 次全量保留。
+/// N=3 的依据：排查时至少要看到「它开始出现」和「它不是偶发」两件事。
+static const NSUInteger DCLRepeatShapeFullPass = 3;
+
+/// 超过全量次数之后，每 N 行抽 1 行写盘。
+/// 为什么要抽样而不是一刀切掉：宿主那种「renderer 每帧建一次(filter node)」的行，
+/// 一旦完全不写，事后就说不清它到底停在哪一帧、有没有停 —— 抽样保留了「还在持续」这个事实。
+static const NSUInteger DCLRepeatShapeSampleEvery = 10;
+
+/// 形态表容量上限，到顶整表清零重开。
+/// 字典是会长大的，而宿主能吐出的形态种类没有上限，不封顶就是慢性内存泄漏。
+static const NSUInteger DCLThrottleTableMaxKeys = 512;
+
+/// 形态计数窗口（秒）。到点清零计数。
+/// 不做窗口的话，三小时前刷过一轮的行会被永久降权，之后它哪怕只在崩溃前才出现一次也漏写。
+static const NSTimeInterval DCLThrottleWindowSeconds = 300.0;
+
 #pragma mark - 内部状态
 
 /// 所有写盘 / 截断都在这条串行队列里完成，天然互斥，不必再上锁。
@@ -48,6 +67,19 @@ static NSString *g_last_line = nil;    // 上一次真正写出去的行（用�
 static NSUInteger g_last_repeat = 0;   // 该行已连续出现的次数（含首次）
 static NSUInteger g_noise_dropped = 0; // 被判为系统刷屏而丢弃的行数
 
+/// 常驻写句柄。旧实现每行都是 open/write/close 三连 syscall，
+/// 而这几万次 open/close 换来的东西跟用一个长命 fd 完全一样。
+static int g_write_fd = -1;
+
+/// 形态 -> 已出现次数。只统计「已决定不限制写入的那些配額」，别无他用。
+static NSMutableDictionary<NSString *, NSNumber *> *g_shape_counts = nil;
+static NSTimeInterval g_window_start = 0;      // 当前计数窗口起点（0 = 还没开表）
+static NSUInteger g_window_throttled = 0;      // 本窗口被抽样掉的行数
+
+// 这三条只用于健康自检展示，会被别的线程读；允许拿到略旧的值，故只加 volatile。
+static volatile NSUInteger g_written_lines = 0;   // 本会话真正落盘的行数
+static volatile NSUInteger g_throttled_lines = 0; // 被形态抽样压掉的行数
+
 static int g_pipe_read = -1;
 static int g_pipe_write = -1;   // 刻意长期持有：写端不关，管道就永远不会被 EOF
 static int g_saved_err = -1;
@@ -57,6 +89,20 @@ static int32_t g_capture_ok = 0;
 #pragma mark - 文件 IO（只在队列内调用）
 
 static NSString *dcl_runtime_path(void) { return [DCLLogger runtimeLogPath]; }
+
+/// 常驻写句柄：开着就不用每行 open 一次。拉不起来（目录被删）就老实返回 NO，让调用方放弃这一行。
+static BOOL dcl_ensure_write_fd_locked(void) {
+    if (g_write_fd >= 0) return YES;
+    int fd = open([dcl_runtime_path() fileSystemRepresentation],
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return NO;
+    g_write_fd = fd;
+    return YES;
+}
+
+static void dcl_close_write_fd_locked(void) {
+    if (g_write_fd >= 0) { close(g_write_fd); g_write_fd = -1; }
+}
 
 /// 保留文件尾部 keep 字节、丢掉头部。有界内存：一次最多吃 keep 字节（见调用处的常量）。
 /// 这不是「优雅瘦身」，是保命 —— 宿主一次崩溃前可能刷出几 MB，
@@ -101,21 +147,41 @@ static void dcl_trim_file_to_tail_locked(NSString *path, NSUInteger keep, const 
 /// 真正落盘一行。返回是否成功写出。
 static BOOL dcl_write_raw_locked(const char *bytes, NSUInteger len) {
     if (!bytes || len == 0) return NO;
-    NSString *path = dcl_runtime_path();
-    int fd = open([path fileSystemRepresentation], O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) return NO;
-    ssize_t w = write(fd, bytes, (size_t)len);
-    close(fd);
+    if (!dcl_ensure_write_fd_locked()) return NO;
+
+    ssize_t w = write(g_write_fd, bytes, (size_t)len);
+    if (w < 0) {
+        // 最常见的原因是日志目录被人在外面清掉了：老 fd 还指着那个已被 unlink 的 inode，
+        // 写得进去但永远看不见。重开一次拿新 inode，再失败就认输，绝不在这里重试打转。
+        dcl_close_write_fd_locked();
+        if (!dcl_ensure_write_fd_locked()) return NO;
+        w = write(g_write_fd, bytes, (size_t)len);
+    }
     if (w <= 0) return NO;
+
+    g_written_lines++;
     g_current_bytes += w;
     if (g_current_bytes > (off_t)DCLRuntimeLogMaxBytes) {
         off_t newSize = 0;
-        dcl_trim_file_to_tail_locked(path, DCLRuntimeLogKeepBytes,
+        dcl_trim_file_to_tail_locked(dcl_runtime_path(), DCLRuntimeLogKeepBytes,
                                      "\n----- [DCL] size cap reached: dropped oldest lines -----\n",
                                      &newSize);
         g_current_bytes = newSize;
+        // 裁剪时 g_written_lines 刻意不回退：它统计的是「写出去过多少行」，
+        // 被闸门删掉是另一件事，两笔账不能混。
     }
     return YES;
+}
+
+/// 写我们自己的批注（限流摘要、重复计数等）。
+/// 关键是写完要把折叠链断开 —— 否则下一行会拿批注前的那行做重复比对，数量就串了。
+static void dcl_write_note_locked(NSString *note) {
+    if (note.length == 0) return;
+    NSString *out = [note stringByAppendingString:@"\n"];
+    NSUInteger byteLen = [out lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    dcl_write_raw_locked([out UTF8String], byteLen);
+    g_last_line = nil;
+    g_last_repeat = 0;
 }
 
 #pragma mark - 行处理（只在队列内调用）
@@ -137,10 +203,128 @@ static BOOL dcl_is_known_system_noise(NSString *line) {
     return NO;
 }
 
-static void dcl_handle_line_locked(NSString *line) {
+/// 疑似崩溃 / 取证相关的行：一律不降级。
+/// 宁可多留几十行，也绝不能让命案现场的证词被当成重复噪音扔掉 —— 这是降频唯一的红线。
+static BOOL dcl_is_forensic_line(NSString *line) {
+    static NSArray<NSString *> *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = @[
+            @"EXC_", @"SIGABRT", @"SIGSEGV", @"SIGBUS", @"SIGILL", @"SIGTRAP", @"signal",
+            @"NSException", @"uncaught exception", @"assert", @"fatal",
+            @"abort", @"backtrace", @"stack trace", @"panic",
+            @"error:", @"fail",
+        ];
+    });
+    for (NSString *k in keys) {
+        if ([line rangeOfString:k options:NSCaseInsensitiveSearch].length) return YES;
+    }
+    return NO;
+}
+
+/// 行的「形态」key：连续数字归一成 #，十六进制地址归一成 0x#，并截断到定长。
+/// 存在的目的只有一个 —— 让「同一处代码吐出的同一句话」在不同参数下落进同一个计数桶。
+/// 真机实测：12 分钟里有 2177 行宿主日志，形态却只有 607 种，重复率 72%。
+static NSString *dcl_shape_key(NSString *line) {
+    const char *utf8 = [line UTF8String];
+    if (!utf8 || !*utf8) return nil;
+
+    const size_t cap = 120;
+    char buf[cap + 1];
+    size_t o = 0;
+    BOOL inNum = NO;
+
+    for (size_t i = 0; utf8[i] != '\0' && o < cap; ) {
+        unsigned char c = (unsigned char)utf8[i];
+        if (c >= '0' && c <= '9') {
+            if (!inNum) { buf[o++] = '#'; inNum = YES; }
+            i++;
+            continue;
+        }
+        inNum = NO;
+
+        if (c == '0' && (utf8[i + 1] == 'x' || utf8[i + 1] == 'X')) {
+            size_t j = i + 2;
+            BOOL anyHex = NO;
+            while (utf8[j]) {
+                unsigned char h = (unsigned char)utf8[j];
+                BOOL isHex = (h >= '0' && h <= '9') ||
+                             (h >= 'a' && h <= 'f') ||
+                             (h >= 'A' && h <= 'F');
+                if (!isHex) break;
+                anyHex = YES; j++;
+            }
+            if (anyHex) {
+                if (o + 3 <= cap) { buf[o++] = '0'; buf[o++] = 'x'; buf[o++] = '#'; }
+                i = j;
+                continue;
+            }
+        }
+
+        buf[o++] = (char)c;
+        i++;
+    }
+    buf[o] = '\0';
+    if (o == 0) return nil;
+    return [NSString stringWithUTF8String:buf];
+}
+
+/// 窗口到点：结掉本轮统计。
+/// 写摘要而不是给每行打标记 —— 给每个被限流的形态都打一行的话，
+/// 光标记本身就能占掉几百行，等于把省下来的份额又吐回去。
+static void dcl_roll_throttle_window_locked(NSTimeInterval now) {
+    if (g_window_start <= 0) { g_window_start = now; return; }
+    NSTimeInterval span = now - g_window_start;
+    if (span < DCLThrottleWindowSeconds) return;
+
+    if (g_window_throttled > 0) {
+        NSString *note = [NSString stringWithFormat:
+                          @"[DCL] log throttle: %lu lines sampled out in the last %.0fs "
+                          @"(repeated lines keep first %lu hits, then 1/%lu)",
+                          (unsigned long)g_window_throttled, span,
+                          (unsigned long)DCLRepeatShapeFullPass,
+                          (unsigned long)DCLRepeatShapeSampleEvery];
+        dcl_write_note_locked(note);
+    }
+    [g_shape_counts removeAllObjects];
+    g_window_start = now;
+    g_window_throttled = 0;
+}
+
+/// 这一行要不要被本轮抽样跳过。
+static BOOL dcl_should_throttle_locked(NSString *line) {
+    if ([line hasPrefix:@"[DCL]"]) return NO;          // 自己写的行一个字都不许动
+    if (dcl_is_forensic_line(line)) return NO;         // 疑似崩溃证据，放行
+
+    NSString *key = dcl_shape_key(line);
+    if (key.length == 0) return NO;
+
+    if (!g_shape_counts) {
+        g_shape_counts = [NSMutableDictionary dictionaryWithCapacity:64];
+    } else if (g_shape_counts.count >= DCLThrottleTableMaxKeys) {
+        // 到顶就整表清零重开：字典必须是有界的，这是硬要求
+        [g_shape_counts removeAllObjects];
+    }
+
+    NSUInteger n = [g_shape_counts[key] unsignedIntegerValue] + 1;
+    g_shape_counts[key] = @(n);
+    if (n <= DCLRepeatShapeFullPass) return NO;
+    return ((n - DCLRepeatShapeFullPass) % DCLRepeatShapeSampleEvery) != 0;
+}
+
+/// now：进入队列时的秒级时间戳。一次批量只取一次时钟，避免每行一次 syscall。
+static void dcl_handle_line_locked(NSString *line, NSTimeInterval now) {
     if (line.length == 0) return;
 
+    dcl_roll_throttle_window_locked(now);
+
     if (dcl_is_known_system_noise(line)) { g_noise_dropped++; return; }
+
+    if (dcl_should_throttle_locked(line)) {
+        g_throttled_lines++;
+        g_window_throttled++;
+        return;   // 刻意不动 g_last_line：抽样不影响连续折叠的判断基准
+    }
 
     // 连续重复行折叠：只写第一行，结束时补一句重复计数。
     // 注意保留「重复发生」这个事实，而不是静默删掉 —— 排查时「同一行吐了 3000 次」
@@ -150,10 +334,9 @@ static void dcl_handle_line_locked(NSString *line) {
         return;
     }
     if (g_last_repeat > 1) {
-        NSString *note = [NSString stringWithFormat:
-                          @"  ... [DCL] previous line repeated %lu more times\n",
-                          (unsigned long)(g_last_repeat - 1)];
-        dcl_write_raw_locked([note UTF8String], [note lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+        dcl_write_note_locked([NSString stringWithFormat:
+                               @"  ... [DCL] previous line repeated %lu more times",
+                               (unsigned long)(g_last_repeat - 1)]);
     }
 
     NSString *out = [line stringByAppendingString:@"\n"];
@@ -172,40 +355,57 @@ static void dcl_restore_original_streams(void) {
     if (g_saved_out >= 0) { dup2(g_saved_out, STDOUT_FILENO); close(g_saved_out); g_saved_out = -1; }
 }
 
-/// 一段数据切成若干行交给管家。跨 read 的半行由 stage 承接。
-static void dcl_pump_feed(NSMutableData *stage, const char *bytes, size_t len) {
-    char nl = '\n';
-    for (size_t i = 0; i < len; i++) {
-        if (bytes[i] == nl) {
-            NSUInteger l = [stage length];
-            if (l) {
-                // 先剥掉 Windows 式行尾的 \r：留下的话它会被 ASCII 净化换成换行，
-                // 于是一行日志变成两行，重复折叠也会被它搅乱。
-                unsigned char last = ((const unsigned char *)[stage bytes])[l - 1];
-                if (last == '\r') l -= 1;
-            }
-            if (l) {
-                NSString *s = [[NSString alloc] initWithBytes:[stage bytes] length:l
-                                                     encoding:NSUTF8StringEncoding];
-                if (!s) {
-                    s = [[NSString alloc] initWithBytes:[stage bytes] length:l
-                                                encoding:NSISOLatin1StringEncoding];
-                }
-                [DCLLogger appendRuntimeLine:s];
-            }
-            [stage setLength:0];
-            continue;
-        }
+/// 把「stage 里攒的半行」+「本次刚读到的一段」拼成一行。stage 为空时直接用读缓冲，不拷贝。
+static NSString * _Nullable dcl_line_from_parts(NSMutableData *stage, const char *bytes, size_t len) {
+    NSUInteger staged = [stage length];
+    NSUInteger l = staged;
+    const void *raw = NULL;
+
+    if (staged == 0) {
+        l = len;
+        raw = bytes;
+    } else {
+        if (len) [stage appendBytes:bytes length:len];
+        l = [stage length];
+        raw = [stage bytes];
+    }
+    // 先剥掉 Windows 式行尾的 \r：留下的话它会被 ASCII 净化换成换行，
+    // 于是一行日志变成两行，重复折叠也会被它搅乱。
+    if (l && ((const unsigned char *)raw)[l - 1] == '\r') l -= 1;
+    if (l == 0) return nil;
+
+    NSString *s = [[NSString alloc] initWithBytes:raw length:l encoding:NSUTF8StringEncoding];
+    return s ?: [[NSString alloc] initWithBytes:raw length:l encoding:NSISOLatin1StringEncoding];
+}
+
+/// 一段数据切成若干行塞进 outLines。跨 read 的半行由 stage 承接。
+///
+/// 旧实现是逐字节 appendData：真机 12 分钟吐了 316 KB，那就是 31 万次 ObjC 消息
+/// 外加同样多次的容量检查 —— 干的活跟 memchr 找换行一模一样，成本却高了三个数量级。
+static void dcl_pump_feed(NSMutableData *stage, const char *bytes, size_t len,
+                          NSMutableArray<NSString *> *outLines) {
+    size_t i = 0;
+    while (i < len) {
+        const char *nl = (const char *)memchr(bytes + i, '\n', len - i);
+        if (!nl) break;    // 剩下的是半行，交给 stage 兜到下一次 read
+
+        size_t segLen = (size_t)(nl - (bytes + i));
+        NSString *s = dcl_line_from_parts(stage, bytes + i, segLen);
+        if (s) [outLines addObject:s];
+        [stage setLength:0];
+        i += segLen + 1;   // 跳过换行符本身
+    }
+
+    if (i < len) {
+        // 超长无换行保护：stage 已顶到上限就先把旧的这截吐出去，再收新的，
+        // 绝不让单行把内存吃掉。
         if ([stage length] >= DCLRuntimeLogMaxLineBytes) {
-            // 超长无换行：先吐一段并打标，绝不让单行把内存吃掉
-            NSString *s = [[NSString alloc] initWithBytes:[stage bytes] length:[stage length]
-                                                 encoding:NSUTF8StringEncoding]
-                          ?: @"(undecodable)";
-            [DCLLogger appendRuntimeLine:s];
-            [DCLLogger appendRuntimeLine:@"[DCL] previous line was truncated (no newline)"];
+            NSString *s = dcl_line_from_parts(stage, "", 0);
+            if (s) [outLines addObject:s];
+            [outLines addObject:@"[DCL] previous line was truncated (no newline)"];
             [stage setLength:0];
         }
-        [stage appendBytes:(bytes + i) length:1];
+        [stage appendBytes:(bytes + i) length:(len - i)];
     }
 }
 
@@ -215,12 +415,19 @@ static void *dcl_log_pump(void *ctx) {
 
     char chunk[4096];
     NSMutableData *stage = [NSMutableData dataWithCapacity:DCLRuntimeLogMaxLineBytes * 2];
+    NSMutableArray<NSString *> *batch = [NSMutableArray arrayWithCapacity:32];
 
     while (1) {
         @autoreleasepool {
             ssize_t n = read(g_pipe_read, chunk, sizeof(chunk));
             if (n > 0) {
-                dcl_pump_feed(stage, chunk, (size_t)n);
+                dcl_pump_feed(stage, chunk, (size_t)n, batch);
+                if (batch.count) {
+                    // 一次 read 切出来的所有行只投递一次到账：
+                    // 省掉「每行一次 block 分配 + 一次队列入队」这笔最冤的成本。
+                    [DCLLogger appendRuntimeLines:batch];
+                    [batch removeAllObjects];
+                }
             } else if (n == 0) {
                 break;   // 写端全关（异常场景），恢复宿主原流后退出
             } else if (errno == EINTR) {
@@ -284,6 +491,22 @@ static void *dcl_log_pump(void *ctx) {
             dcl_trim_file_to_tail_locked(prev, DCLRuntimeLogKeepBytes, NULL, &ignored);
         }
         g_current_bytes = 0;   // 尚未有任何写入竞争：构造函数阶段还没有别的调用者
+
+        // 会话换了，计数与常驻 fd 都得跟着换：旧 fd 指的还是那个已被 rename 成
+        // _prev 的 inode，留着写就变成「本轮日志写进上一轮文件」。
+        // 这里用 sync 是因为这些变量按约定只在队列内访问；rotate 由构造函数调用，
+        // 彼时队列必然是空的，不会自锁。
+        dispatch_sync(dcl_log_queue(), ^{
+            dcl_close_write_fd_locked();
+            [g_shape_counts removeAllObjects];
+            g_window_start = 0;
+            g_last_line = nil;
+            g_last_repeat = 0;
+            g_noise_dropped = 0;
+            g_window_throttled = 0;
+            g_written_lines = 0;
+            g_throttled_lines = 0;
+        });
     } @catch (id e) {
         (void)e;
     }
@@ -352,6 +575,12 @@ static void *dcl_log_pump(void *ctx) {
     return DCLRuntimeLogMaxBytes;
 }
 
+#pragma mark - 降频统计（自检展示用）
+
++ (NSUInteger)writtenLineCount   { return g_written_lines; }
++ (NSUInteger)throttledLineCount { return g_throttled_lines; }
++ (NSUInteger)noiseDroppedCount  { return g_noise_dropped; }
+
 #pragma mark - 写入
 
 + (void)appendRuntimeLine:(NSString *)line {
@@ -362,7 +591,27 @@ static void *dcl_log_pump(void *ctx) {
             // ASCII 净化必须排在折叠之前：若先折叠，同一条中文行在不同字符集下
             // 会各占一份，折叠规则就失效了。
             NSString *ascii = DCLASCIISanitized(captured);
-            dcl_handle_line_locked(ascii);
+            dcl_handle_line_locked(ascii, (NSTimeInterval)DCLNowUs() / 1000000.0);
+        }
+    });
+}
+
+/// 批量版：一次 read 切出来的若干行只用一次 dispatch_async。
+///
+/// 这是整轮 IO 优化里最实在的一笔账。旧版每行都要一次 block 分配 + 一次队列入队，
+/// 而这些行的处理逻辑本身（净化、限流判定、写盘）是同一个队列范围内的连续动作，
+/// 完全没有必要为它们各自排一次队。
++ (void)appendRuntimeLines:(NSArray<NSString *> *)lines {
+    if (lines.count == 0) return;
+    NSArray<NSString *> *captured = [lines copy];
+    dispatch_async(dcl_log_queue(), ^{
+        @autoreleasepool {
+            // 整批只取一次时钟：窗口判定只需要秒级精度，没必要每行一次 gettimeofday
+            NSTimeInterval now = (NSTimeInterval)DCLNowUs() / 1000000.0;
+            for (NSString *l in captured) {
+                NSString *ascii = DCLASCIISanitized(l);
+                dcl_handle_line_locked(ascii, now);
+            }
         }
     });
 }

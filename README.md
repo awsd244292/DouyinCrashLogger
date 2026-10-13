@@ -43,6 +43,20 @@
 > ② 设置入口：**双通道**（详见 `DCLSettings.m` 的 `registerEntry`）——
 >    · **主通道**：DYStorage 已安装 → 走 `DYStorageManager` 收纳入口（运行时注册、统一渲染跳转）；
 >    · **兜底通道**：`DYStorageManager` 类**完全缺席** → 降级为 hook 抖音设置页注入「DCL 崩溃取证」入口行
+>   两条通道对外呈现收敛为**唯一入口：抖音设置页里那一行**（标题 `DCL 崩溃日志` + 副标题带版本号），
+>   不存在悬浮球 / 长按面板等第二入口形态。
+>
+> **设置面板形态 = Bottom Sheet（上滑出场 + 毛玻璃）**：
+>   · 走 iOS 15+ 原生 `UISheetPresentationController`（detents 中/大、顶部 grabber、20pt 圆角），
+>     **上滑进场 / 下滑手势关闭 / 阻尼手感全部由系统负责**，不是自绘；
+>     （抖音当前 App Store 已要求 iOS 15+，dylib 实际只在 ≥15 运行，
+>      `min=14.0` 是为旧 IPA 留的后路，代码用 `@available` 守卫后回退 PageSheet。）
+>   · 毛玻璃由面板自身最底层的 `UIVisualEffectView`（`.systemThickMaterial`）实现，
+>     实时采样下层抖音界面 → 真 frosted glass；导航栏用 `configureWithTransparentBackground`
+>     置透明，避免顶部不透明白条把模糊「截胡」。
+>   · 入口图标刻意留空：抖音用的是自家内部 svg 资源名，猜错只会得到空白占位，
+>     不如交给系统按 item 默认样式渲染。
+
 >      （守卫版：`AWESettingsViewModel` / `AWESettingItemModel` / `AWESettingSectionModel` 任一缺失即静默跳过）。
 >   两条通道**互斥**——只要 `DYStorageManager` 类存在就走主通道、绝不装兜底，永不对同一方法重复 swizzle。
 > 这是本项目的架构红线——**核心捕获链路禁止绑到抖音私有类**（设置入口兜底属 UI 入口层、可降级，不进捕获链路）。

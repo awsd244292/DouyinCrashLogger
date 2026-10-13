@@ -124,3 +124,13 @@ DYStorage 提供 `registerControllerWithIdentifier:title:version:controller:` �
 - **双通道铁律**: 只要 `DYStorageManager` 类存在就走主通道、`return` 不装兜底——**绝不能**与本插件和收纳插件对 `AWESettingsViewModel.sectionDataArray` 的同方法 swizzle 打架。三者（`AWESettingsViewModel`/`AWESettingItemModel`/`AWESettingSectionModel`）任一缺失即静默跳过（抖音版本变更时只令入口失效、不崩）。
 - **UIScrollView 内按钮不灵敏**: 根因是 `UIScrollView.delaysContentTouches` 默认 YES，会先犹豫 ~150ms 判断是否滚动，导致内部 `UIButton` 点着发钝。修复：`scroll.delaysContentTouches = NO` + `canCancelContentTouches = NO`，按钮最小高度 46 增大热区。
 - **元数据**: 来源: 用户 bug 反馈 + 真实源码查证; 相关文件: DCLSettings.m(registerEntry/installSettingsPageFallback); 标签: DYStorage, 入口兜底, 设置页注入, 双通道, 滚动按钮, delaysContentTouches
+
+---
+
+## LRN-20261013-005 · iOS 版本基线（抖音 ≥15）+ Bottom Sheet 组合做法 + 发热源定位
+
+- **版本基线（已查证 App Store）**: 当前抖音（v40.7.0）App Store 标 **Requires iOS 15.0+**（老版本才 13.0）。dylib 只会被注入进抖音 ⇒ **实际运行下限就是 iOS 15**，本工程 `iOS min=14.0` 属于给旧 IPA 留的后路。**结论：可放心使用 iOS 15+ API，只需 `@available` 守卫回退**（不要为了兼容 iOS 14 自绘转场）。
+- **Bottom Sheet 最优组合**: **iOS 15+ 原生 `UISheetPresentationController`**（detents 中/大 + `prefersGrabberVisible` + 圆角）负责上滑进场 / grabber / 下滑手势关闭 / 阻尼；**毛玻璃由面板自身最底层 `UIVisualEffectView`(.systemThickMaterial) 实现**（会实时采样下层抖音界面 = 真 frosted glass）。另有两坑：① 导航栏必须 `UINavigationBarAppearance configureWithTransparentBackground` 置透明，否则顶部不透明白条把模糊「截胡」；② 上层控件背景若仍不透明会把模糊糊死（statusView 已改 clear）。
+- **入口图标不要猜**: 抖音 `AWESettingItemModel` 的 `svgIconImageName`/`iconImageName` 是自家内部 svg 资源名，猜错只得到空白占位（不崩但难看），刻意留空交给系统默认渲染更稳。
+- **发热源定位方法（附件分析方法论）**: 先看性能插件 snapshot 的 `freezeWatchdog`（采样器是否在跑 / 间隔 / 样本数）与开关日志里的「耗时 xxx ms」；再看 runtime log 的高频重复行（去重后的 top-N 模式最能暴露 churn）。本次结论：**纯插件负担 = PerfDebugPlugin 的 100ms 主线程栈采样 + 250ms ping 看门狗 + 启动 attr_sanitize 扫 3000 类耗时 3289ms**；**真正的 CPU 大户是宿主自身**——12 分钟内解码器 create/flush/destroy 约 80/71/70 次、渲染 filter node 构造/析构约 65/(63+84) 次、`tls ssl init` 重连 51 次（连接池复用失效，可优化异常）。注意此类插件常出现 `cpuReadoutOk:-1`（CPU 读数失败），此时**无直接 CPU% 归因**，结论须声明为推断。
+- **元数据**: 来源: App Store 查证 + 三开源仓库 + 4 份运行日志分析; 相关文件: DCLSettings.m(presentSettings/viewDidLoad/dcl_makeFallbackItem); 标签: BottomSheet, UISheetPresentationController, 毛玻璃, iOS基线, 发热源, 性能分析

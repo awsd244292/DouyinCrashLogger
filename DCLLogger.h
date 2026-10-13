@@ -7,7 +7,14 @@
 //  背景（真机反馈里三条抱怨，两条都归它管）：
 //    · 日志永远不清 → 现在按会话轮转 + 单会话大小闸门 + 崩溃日志保留份数；
 //    · 文件又大又乱 → stderr 不再 freopen 直写，改走「管道 + 后台泵」，
-//      坐享过滤噪音、折叠重复行的机会，从这里把体积压下来。
+//      历经三个阶段把体积压下来：过滤已知刷屏 → 折叠连续重复 → 形态级抽样限流。
+//
+//  降频的红线（不可越过）：
+//    形态级抽样只对「同一种话的第 4 次及以后」下手，且满足任一条件即无条件放行 ——
+//      1) 本插件自己写的行（[DCL] 前缀）；
+//      2) 疑似崩溃取证相关（EXC_ / SIGx / NSException / assert / fatal / ERROR: ...）。
+//    另外每个窗口结束会补一行「本轮抽样压掉了多少行」的摘要：
+//    被压掉这件事本身必须可查，绝不做悄悄就扔的事。
 //
 //  三条硬约束（对宿主负责）：
 //    1) 管道写端必须 O_NONBLOCK —— 万一泵线程出岔子，宿主的 fprintf 拿 EAGAIN 直接失败，
@@ -53,9 +60,24 @@ NS_ASSUME_NONNULL_BEGIN
 #pragma mark - 写入
 
 /// 追加一行到当前会话日志。异步返回，永不阻塞调用方。
-/// 内部依次做：ASCII 净化 → 噪音过滤 → 连续重复行折叠 → 大小闸门。
+/// 内部依次做：ASCII 净化 → 噪音过滤 → 形态限流 → 连续重复行折叠 → 大小闸门。
 /// 非 ASCII 全会被转义，故本方法不接受也不产出中文（如需人读的中文报告，写 latest.log）。
 + (void)appendRuntimeLine:(NSString *)line;
+
+/// 批量版：多行走一次入队。管道的泵线程用它投递一次 read 切出来的全部行。
+/// 语义与 appendRuntimeLine: 完全一致，只是便宜得多（省掉每行一次队列入队）。
++ (void)appendRuntimeLines:(NSArray<NSString *> *)lines;
+
+#pragma mark - 降频统计
+
+/// 本会话已真正落盘的行数（健康自检展示，允许取到略旧的值）
++ (NSUInteger)writtenLineCount;
+
+/// 被「形态级抽样」压掉的行数 —— 这些是同一种话第 4 次以后的重复，不是随机丢日志
++ (NSUInteger)throttledLineCount;
+
+/// 被判为系统刷屏而剔除的行数（如 objc runtime 对宿主 category 属性的抱怨）
++ (NSUInteger)noiseDroppedCount;
 
 #pragma mark - 清理
 

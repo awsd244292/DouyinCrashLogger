@@ -133,7 +133,12 @@ static id dcl_makeFallbackItem(void) {
     if (!item) return nil;
     dcl_setValueSafe(item, @"identifier", kDCLStorageIdentifier);
     dcl_setValueSafe(item, @"title", kDCLStorageEntryTitle);
-    dcl_setValueSafe(item, @"detail", @"");
+    // 副标题带版本号：让抖音设置页这一行长得像原生两行式 cell（主标题 + 灰色副标题），
+    // 也让用户一眼确认装的哪版，排查时省一轮来回。
+    dcl_setValueSafe(item, @"detail",
+                     [NSString stringWithFormat:@"崩溃取证 · v%@", DCLPluginVersion]);
+    // 图标不敢猜：抖音用的是自家内部 svg 资源名，填错只会显示空白占位（不会崩），
+    // 与其撞运气不如留空，交给系统按 item 默认样式渲染。
     dcl_setValueSafe(item, @"svgIconImageName", @"");
     dcl_setValueSafe(item, @"iconImageName", @"");
     dcl_setValueSafe(item, @"type", @0);
@@ -259,9 +264,39 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
         DCLSettingsViewController *panel = [[DCLSettingsViewController alloc] init];
         UINavigationController *nav =
             [[UINavigationController alloc] initWithRootViewController:panel];
+
+        // 导航栏透明：否则顶部一条不透明白条会把毛玻璃「截胡」，面板看着像被切了头。
         if (@available(iOS 13.0, *)) {
+            UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+            [appearance configureWithTransparentBackground];
+            nav.navigationBar.standardAppearance = appearance;
+            nav.navigationBar.scrollEdgeAppearance = appearance;
+        }
+
+        // Bottom Sheet：iOS 15+ 走原生 UISheetPresentationController，顺势白拿
+        //   上滑进场动画 / 顶部把手 grabber / 下滑手势关闭 / 系统阻尼手感。
+        // 抖音当前 App Store 已要求 iOS 15+，故这分支是实际主路径；
+        // iOS 14 及以下（理论上跑不动新版抖音，但仍守一手）回退 PageSheet。
+        BOOL usedSheet = NO;
+        if (@available(iOS 15.0, *)) {
+            UISheetPresentationController *sheet = nav.sheetPresentationController;
+            if (sheet) {
+                NSMutableArray *detents =
+                    [NSMutableArray arrayWithObject:[UISheetPresentationControllerDetent mediumDetent]];
+                if (@available(iOS 16.0, *)) {
+                    [detents addObject:[UISheetPresentationControllerDetent largeDetent]];
+                }
+                sheet.detents = detents;
+                sheet.prefersGrabberVisible = YES;          // 顶部小把手，明示可下滑关闭
+                sheet.preferredCornerRadius = 20.0;
+                sheet.prefersScrollingExpandsWhenScrolledToEdge = YES;
+                usedSheet = YES;
+            }
+        }
+        if (!usedSheet) {
             nav.modalPresentationStyle = UIModalPresentationPageSheet;
         }
+
         [top presentViewController:nav animated:YES completion:nil];
     } @catch (id e) {
         (void)e;
@@ -279,7 +314,21 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = kDCLStorageEntryTitle;
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
+
+    // Bottom Sheet 的毛玻璃本体：把 UIVisualEffectView 铺在最底层，它会实时采样
+    // 被它遮住的内容（下层就是抖音界面）→ 这才是真 frosted glass，不是贴张半透明色。
+    // 注意：上层任何控件的背景若为不透明色，都会把这层模糊糊死，故下方一律改透明。
+    self.view.backgroundColor = [UIColor clearColor];
+    UIBlurEffect *blurEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThickMaterial];
+    UIVisualEffectView *blurView = [[UIVisualEffectView alloc] initWithEffect:blurEffect];
+    blurView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view insertSubview:blurView atIndex:0];
+    [NSLayoutConstraint activateConstraints:@[
+        [blurView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [blurView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [blurView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [blurView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+    ]];
 
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"关闭"
@@ -301,7 +350,8 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
     self.statusView.selectable = YES;
     self.statusView.font = [UIFont systemFontOfSize:13];
     self.statusView.textColor = [UIColor labelColor];
-    self.statusView.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    // 透明 → 直接透出底层毛玻璃，不再叠一层灰底把它糊住
+    self.statusView.backgroundColor = [UIColor clearColor];
     self.statusView.layer.cornerRadius = 10;
     self.statusView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
 
