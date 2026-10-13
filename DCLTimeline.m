@@ -81,10 +81,15 @@ void DCLTimelineRecordC(DCLTimelineEventKind kind, int32_t aux, const char *deta
 #pragma mark - 内部：快照拷贝
 
 /// 计算缓冲读取的起点与有效条数。崩溃路径与普通路径共用一段换算，避免两处写歪。
-static inline void dcl_tl_range(uint32_t *outStart, NSUInteger *outCount) {
+///
+/// outStart 用 NSUInteger 而不是 uint32_t：iPhoneOS16.5 SDK 下真编译会报
+/// incompatible pointer types —— 那不是洁癖警告，是真事。arm64 上 NSUInteger 是 8 字节，
+/// 往它身上写 4 字节只改到低半截，高半截留的是调用方变量里的原值；
+/// 眼下两个调用点都恰好初始化成 0 才侥幸没炸，哪天有人去掉初始化就是野指针式读越界。
+static inline void dcl_tl_range(NSUInteger *outStart, NSUInteger *outCount) {
     NSUInteger n = g_total > (uint64_t)DCL_TL_CAPACITY ? (NSUInteger)DCL_TL_CAPACITY : (NSUInteger)g_total;
     NSUInteger start = (NSUInteger)((g_head + DCL_TL_CAPACITY - (uint32_t)n) % DCL_TL_CAPACITY);
-    *outStart = (uint32_t)start;
+    *outStart = start;
     *outCount = n;
 }
 
@@ -104,7 +109,7 @@ static NSUInteger dcl_tl_snapshot(DCLTlEntry *out, NSUInteger cap) {
 
 size_t DCLTimelineCopyEntriesUnsafe(DCLTimelineEntry *out, size_t cap) {
     if (!out || cap == 0) return 0;
-    uint32_t start = 0;
+    NSUInteger start = 0;
     NSUInteger n = 0;
     dcl_tl_range(&start, &n);
     size_t m = n < cap ? (size_t)n : cap;
