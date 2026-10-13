@@ -26,8 +26,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface DCLSettings : NSObject
 
-/// 向 DYStorage 注册本插件的设置入口。
-/// DYStorage 未安装（或版本过旧无对应接口）时静默返回，不影响本插件任何功能。
+/// 注册本插件的设置入口（双通道）：
+///   · 主通道：DYStorage 已安装 → 走其收纳入口（统一渲染跳转）；
+///   · 兜底通道：DYStorage 完全缺席 → hook 抖音设置页注入「DCL 崩溃取证」入口行。
+/// 只要 DYStorageManager 类存在就走主通道、绝不走兜底，避免同方法 swizzle 冲突。
 /// 幂等，可重复调用；建议在主线程 runloop 稳定后（延迟块内）调用。
 + (void)registerEntry;
 

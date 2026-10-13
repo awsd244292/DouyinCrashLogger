@@ -40,8 +40,12 @@
 > 崩溃捕获只装 POSIX 信号 + `NSSetUncaughtExceptionHandler`，与被注入 App 的 UI / 私有实现零耦合。
 > 因此**抖音版本迭代不会让"崩溃捕获"本身失效**。工程里仅有的两处抖音耦合都属于可降级项：
 > ① 可选的"播放暂停诊断"探针（hook 的是公开类 `AVPlayer`，属增强而非核心捕获）；
-> ② 设置入口接入 `DYStorageManager`（运行时注册，类不存在则 `nil` 跳过）。
-> 这是本项目的架构红线——**新增任何功能都禁止把核心捕获链路上绑到抖音私有类**。
+> ② 设置入口：**双通道**（详见 `DCLSettings.m` 的 `registerEntry`）——
+>    · **主通道**：DYStorage 已安装 → 走 `DYStorageManager` 收纳入口（运行时注册、统一渲染跳转）；
+>    · **兜底通道**：`DYStorageManager` 类**完全缺席** → 降级为 hook 抖音设置页注入「DCL 崩溃取证」入口行
+>      （守卫版：`AWESettingsViewModel` / `AWESettingItemModel` / `AWESettingSectionModel` 任一缺失即静默跳过）。
+>   两条通道**互斥**——只要 `DYStorageManager` 类存在就走主通道、绝不装兜底，永不对同一方法重复 swizzle。
+> 这是本项目的架构红线——**核心捕获链路禁止绑到抖音私有类**（设置入口兜底属 UI 入口层、可降级，不进捕获链路）。
 
 ---
 

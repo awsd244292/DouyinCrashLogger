@@ -58,43 +58,163 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
 
 + (void)registerEntry {
     @try {
-        // 1) DYStorage 未安装 → Nil，自然跳过。多插件共存场景下本插件无需依赖它。
         Class mgrClass = NSClassFromString(@"DYStorageManager");
-        if (mgrClass == Nil) return;
-        if (![mgrClass respondsToSelector:@selector(sharedManager)]) return;
 
-        // 2) 取单例。DYStorage 注入顺序在我们之前，此时 sharedManager 必已就绪。
-        id mgr = [mgrClass sharedManager];
-        if (mgr == nil) return;
-
-        // 3) 优先 registerController：把设置页 VC 类名交给 DYStorage 统一渲染跳转
-        //    （push 进其设置页导航栈 / 包进全屏 modal present），本插件不再自 present，
-        //    更贴合「统一渲染」设计，也避免自己 present 与 DYStorage 导航栈打架。
-        SEL selCtl = @selector(registerControllerWithIdentifier:title:version:controller:);
-        if ([mgr respondsToSelector:selCtl]) {
-            [mgr registerControllerWithIdentifier:kDCLStorageIdentifier
-                                           title:kDCLStorageEntryTitle
-                                         version:DCLPluginVersion
-                                      controller:NSStringFromClass([DCLSettingsViewController class])];
+        // 主通道：DYStorage 已安装 → 走收纳入口（由它统一渲染跳转）。
+        // 只要「DYStorageManager 类存在」就信任它、绝不走兜底，从根上避免
+        // 本插件与收纳插件对 AWESettingsViewModel.sectionDataArray 的同方法 swizzle 打架。
+        if (mgrClass != Nil) {
+            if ([mgrClass respondsToSelector:@selector(sharedManager)]) {
+                id mgr = [mgrClass sharedManager];
+                if (mgr != nil) {
+                    // 优先 registerController：交 VC 类名，由 DYStorage 统一渲染跳转。
+                    SEL selCtl = @selector(registerControllerWithIdentifier:title:version:controller:);
+                    if ([mgr respondsToSelector:selCtl]) {
+                        [mgr registerControllerWithIdentifier:kDCLStorageIdentifier
+                                                       title:kDCLStorageEntryTitle
+                                                     version:DCLPluginVersion
+                                                  controller:NSStringFromClass([DCLSettingsViewController class])];
+                        return;
+                    }
+                    // 兜底 registerAction：旧版无 registerController 时，注册点击回调 block。
+                    SEL selAct = @selector(registerActionWithIdentifier:title:version:action:);
+                    if ([mgr respondsToSelector:selAct]) {
+                        [mgr registerActionWithIdentifier:kDCLStorageIdentifier
+                                                    title:kDCLStorageEntryTitle
+                                                  version:DCLPluginVersion
+                                                   action:^{
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                [DCLSettings presentSettings];
+                            });
+                        }];
+                        return;
+                    }
+                }
+            }
+            // DYStorage 类在但不可用：它自身仍会收纳其它入口，本插件入口没注册上也不
+            // 装兜底，避免与它对同一方法 swizzle 冲突（极端边角，宁可不显示也不打架）。
             return;
         }
 
-        // 4) 兜底 registerAction：旧版 DYStorage 无 registerController 时，注册一个
-        //    点击回调 block，由 DYStorage 回调本插件后再自 present（与改造前行为一致）。
-        SEL selAct = @selector(registerActionWithIdentifier:title:version:action:);
-        if (![mgr respondsToSelector:selAct]) return;
-        [mgr registerActionWithIdentifier:kDCLStorageIdentifier
-                                    title:kDCLStorageEntryTitle
-                                  version:DCLPluginVersion
-                                   action:^{
-            // DYStorage 的点击回调线程不确定，统一切回主线程再 present。
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [DCLSettings presentSettings];
-            });
-        }];
+        // 兜底通道：DYStorage 完全缺席（双通道设计）→ 直接 hook 抖音设置页注入入口行。
+        // 这是「无收纳插件就完全没入口」的根因修复。
+        [self installSettingsPageFallback];
     } @catch (id e) {
         (void)e;   // 注册失败不影响取证主功能，静默吞掉
     }
+}
+
+#pragma mark - 兜底入口：hook 抖音设置页注入入口行（仅 DYStorage 完全缺席时）
+
+// 参照 xlzs001/DYstorage 真实实现（其 hook 的正是 AWESettingsViewModel.sectionDataArray，
+// 往 sectionDataArray 里 append 自己的 AWESettingSectionModel）。我们做成「守卫版」：
+//   · 仅当 DYStorageManager 类不存在时才装，绝不与它同方法 swizzle 冲突；
+//   · AWESettingsViewModel / AWESettingItemModel / AWESettingSectionModel 任一缺失即静默跳过；
+//   · 全部走 KVC（setValue:forKey:）写私有属性，类名变更只令本组失效、不崩。
+
+static IMP s_dclOrigSectionDataArray = NULL;
+static BOOL s_dclFallbackInstalled = NO;
+
+static void dcl_setValueSafe(id obj, NSString *key, id value) {
+    if (!obj || !key.length) return;
+    @try { [obj setValue:value forKey:key]; } @catch (__unused id e) {}
+}
+
+static NSString *dcl_stringValueSafe(id obj, NSString *key) {
+    id v = nil;
+    @try { v = [obj valueForKey:key]; } @catch (__unused id e) {}
+    return [v isKindOfClass:[NSString class]] ? v : nil;
+}
+
+static id dcl_makeFallbackItem(void) {
+    Class itemClass = NSClassFromString(@"AWESettingItemModel");
+    if (itemClass == Nil) return nil;
+    id item = [[itemClass alloc] init];
+    if (!item) return nil;
+    dcl_setValueSafe(item, @"identifier", kDCLStorageIdentifier);
+    dcl_setValueSafe(item, @"title", kDCLStorageEntryTitle);
+    dcl_setValueSafe(item, @"detail", @"");
+    dcl_setValueSafe(item, @"svgIconImageName", @"");
+    dcl_setValueSafe(item, @"iconImageName", @"");
+    dcl_setValueSafe(item, @"type", @0);
+    dcl_setValueSafe(item, @"cellType", @26);
+    dcl_setValueSafe(item, @"colorStyle", @2);
+    dcl_setValueSafe(item, @"isEnable", @YES);
+    void (^block)(void) = ^{
+        // 点击回调线程不确定，统一切回主线程再 present。
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [DCLSettings presentSettings];
+        });
+    };
+    dcl_setValueSafe(item, @"cellTappedBlock", [block copy]);
+    return item;
+}
+
+static id dcl_makeFallbackSection(void) {
+    id item = dcl_makeFallbackItem();
+    if (!item) return nil;
+    Class sectionClass = NSClassFromString(@"AWESettingSectionModel");
+    if (sectionClass == Nil) return nil;
+    id section = [[sectionClass alloc] init];
+    if (!section) return nil;
+    dcl_setValueSafe(section, @"identifier", kDCLStorageIdentifier);
+    dcl_setValueSafe(section, @"sectionHeaderTitle", @"DCL 崩溃取证");
+    dcl_setValueSafe(section, @"sectionHeaderHeight", @40);
+    dcl_setValueSafe(section, @"type", @0);
+    dcl_setValueSafe(section, @"itemArray", @[item]);
+    return section;
+}
+
+// 只注入到「主设置页」：含 账号 / 账户 / account 区，避免误入其它子页 VM。
+static BOOL dcl_looksLikeMainSettings(NSArray *sections) {
+    if (![sections isKindOfClass:[NSArray class]]) return NO;
+    for (id s in sections) {
+        NSString *t = dcl_stringValueSafe(s, @"sectionHeaderTitle");
+        if ([t isEqualToString:@"账号"] || [t hasPrefix:@"账号"] ||
+            [t isEqualToString:@"账户"] || [t hasPrefix:@"账户"] ||
+            [t isEqualToString:@"account"]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
+    NSArray *(*orig)(id, SEL) = (NSArray *(*)(id, SEL))s_dclOrigSectionDataArray;
+    NSArray *sections = orig ? orig(self, _cmd) : nil;
+    if (![sections isKindOfClass:[NSArray class]]) return sections;
+    if (!dcl_looksLikeMainSettings(sections)) return sections;
+    // 防重复：本 section 已存在则原样返回（VM 可能缓存同一数组实例）。
+    for (id s in sections) {
+        if ([dcl_stringValueSafe(s, @"identifier") isEqualToString:kDCLStorageIdentifier]) {
+            return sections;
+        }
+    }
+    id ourSection = dcl_makeFallbackSection();
+    if (!ourSection) return sections;
+    NSMutableArray *result = [sections mutableCopy];
+    [result addObject:ourSection];
+    return result;
+}
+
++ (void)installSettingsPageFallback {
+    if (s_dclFallbackInstalled) return;
+    // 仅当三个私有模型类齐全才装；任一缺失说明抖音版本变更，静默跳过（不显示入口但不崩）。
+    Class vmClass = NSClassFromString(@"AWESettingsViewModel");
+    if (vmClass == Nil) return;
+    if (NSClassFromString(@"AWESettingItemModel") == Nil) return;
+    if (NSClassFromString(@"AWESettingSectionModel") == Nil) return;
+
+    Method m = class_getInstanceMethod(vmClass, @selector(sectionDataArray));
+    if (m == NULL) return;
+    IMP orig = method_getImplementation(m);
+    if (orig == NULL) return;
+
+    // 捕获「当前」IMP 作为原始实现（可能是其它插件的 hook，天然形成调用链），
+    // 再替换为我们自己的实现。绝不二次安装。
+    s_dclOrigSectionDataArray = orig;
+    method_setImplementation(m, (IMP)dcl_sectionDataArray);
+    s_dclFallbackInstalled = YES;
 }
 
 /// 找当前 keyWindow 的最上层已 present 的 VC（兼容 iOS 13+ 多 scene）。
@@ -169,6 +289,10 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
 
     UIScrollView *scroll = [[UIScrollView alloc] init];
     scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    // 关键：UIScrollView 默认 delaysContentTouches=YES 会先犹豫 ~150ms 判断要不要滚动，
+    // 导致里面的按钮「点着发钝、不灵敏」。关掉它，按钮立即响应。
+    scroll.delaysContentTouches = NO;
+    scroll.canCancelContentTouches = NO;
     [self.view addSubview:scroll];
 
     self.statusView = [[UITextView alloc] init];
@@ -235,6 +359,8 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
     b.backgroundColor = [UIColor tertiarySystemBackgroundColor];
     b.layer.cornerRadius = 10;
     b.contentEdgeInsets = UIEdgeInsetsMake(12, 12, 12, 12);
+    // 最小高度 46，扩大点击热区，避免「按键不灵敏/点不中」的体感。
+    [b.heightAnchor constraintGreaterThanOrEqualToConstant:46].active = YES;
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return b;
 }

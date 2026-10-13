@@ -1,0 +1,13 @@
+# 本地构建产物（由 make deb / make dylib 生成）
+build/
+
+# 从 GitHub Actions 下载的构建产物原始目录
+ci-artifacts/
+
+# 参考副本（用于查证，非交付物）
+_dystore_ref/
+DYStorage_real/
+
+# macOS / 编辑器杂物
+.DS_Store
+*.xcuserstate

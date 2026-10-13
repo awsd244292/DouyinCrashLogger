@@ -114,3 +114,13 @@ DYStorage 提供 `registerControllerWithIdentifier:title:version:controller:` �
 - 相关文件: /workspace/DouyinCrashLogger/DCLCrashReporter.m, DCLSystemSignal.m, DCLPlaybackTracer.m, DCLSettings.m
 - 标签: 崩溃捕获, app无关, signal, 版本漂移, 自愈, 解耦
 - 参见: LRN-20261013-003
+
+---
+
+## LRN-20261013-004 · 无收纳插件时设置入口兜底（双通道）+ 滚动内按钮不灵敏
+
+- **结论**: DCLSettings 入口是「双通道」——DYStorage 安装时走其收纳入口；**完全缺席时**回退 hook 抖音设置页注入入口行，修复「不装收纳插件所有入口都不显示」。
+- **DYStorage 注入机制（已查证真实源码 xlzs001/DYstorage）**: 它 hook 的是 `AWESettingsViewModel` 的 `sectionDataArray` getter，往返回的 `sectionDataArray` 里 append 一个 `AWESettingSectionModel`；每个入口是 `AWESettingItemModel`，要点属性（全 KVC 写私有属性）：`identifier`/`title`/`detail`/`cellType=26`/`colorStyle=2`/`isEnable`/`cellTappedBlock`（点击回调）。仅「主设置页」（含 账号/账户/account 区）注入。
+- **双通道铁律**: 只要 `DYStorageManager` 类存在就走主通道、`return` 不装兜底——**绝不能**与本插件和收纳插件对 `AWESettingsViewModel.sectionDataArray` 的同方法 swizzle 打架。三者（`AWESettingsViewModel`/`AWESettingItemModel`/`AWESettingSectionModel`）任一缺失即静默跳过（抖音版本变更时只令入口失效、不崩）。
+- **UIScrollView 内按钮不灵敏**: 根因是 `UIScrollView.delaysContentTouches` 默认 YES，会先犹豫 ~150ms 判断是否滚动，导致内部 `UIButton` 点着发钝。修复：`scroll.delaysContentTouches = NO` + `canCancelContentTouches = NO`，按钮最小高度 46 增大热区。
+- **元数据**: 来源: 用户 bug 反馈 + 真实源码查证; 相关文件: DCLSettings.m(registerEntry/installSettingsPageFallback); 标签: DYStorage, 入口兜底, 设置页注入, 双通道, 滚动按钮, delaysContentTouches
