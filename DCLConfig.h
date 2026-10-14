@@ -95,6 +95,12 @@ typedef NS_ENUM(NSUInteger, DCLCaptureProfile) {
 /// 三态循环切换：safe → full → off → safe（摇一摇热切换入口）
 + (void)toggleProfile;
 
+/// 摇一摇热切换是否启用（防误触开关）。默认 YES；存 NSUserDefaults，即时生效。
+/// 关掉后摇一摇不再翻转档位 —— 钩子本身保留透传（零成本），只是不再响应。
+/// 注意：若同时处于 off 档且未安装 DYStorage，重新开启只能靠 capture_mode.txt 文件。
++ (BOOL)shakeEnabled;
++ (void)setShakeEnabled:(BOOL)enabled;
+
 @end
 
 NS_ASSUME_NONNULL_END

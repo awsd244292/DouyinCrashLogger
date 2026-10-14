@@ -20,3 +20,4 @@ NSString * const DCLRuntimeLogFileName = @"plugin_runtime.log";
 NSString * const DCLSnapshotLogFileName = @"latest.log";
 NSString * const DCLCaptureModeFileName = @"capture_mode.txt";
 NSString * const DCLCaptureModeDefaultsKey = @"DCL_capture_mode";
+NSString * const DCLShakeEnabledDefaultsKey = @"DCL_shake_enabled";

@@ -50,4 +50,7 @@ FOUNDATION_EXPORT NSString * const DCLCaptureModeFileName;
 /// NSUserDefaults key：采集方案（开关文件不存在时的备选取值）
 FOUNDATION_EXPORT NSString * const DCLCaptureModeDefaultsKey;
 
+/// NSUserDefaults key：摇一摇热切换是否启用（防误触开关，默认 YES）
+FOUNDATION_EXPORT NSString * const DCLShakeEnabledDefaultsKey;
+
 NS_ASSUME_NONNULL_END

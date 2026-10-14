@@ -194,6 +194,23 @@ static NSString *dcl_profile_text(DCLCaptureProfile p) {
     [self setProfile:next];
 }
 
+#pragma mark - 摇一摇防误触开关
+
++ (BOOL)shakeEnabled {
+    // key 不存在（从未设置过）→ 默认 YES，保持老行为
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:DCLShakeEnabledDefaultsKey];
+    if (!v) return YES;
+    return [v boolValue];
+}
+
++ (void)setShakeEnabled:(BOOL)enabled {
+    @try {
+        [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:DCLShakeEnabledDefaultsKey];
+    } @catch (id e) {
+        (void)e;
+    }
+}
+
 #pragma mark - 能力矩阵
 
 + (BOOL)isDisabled {

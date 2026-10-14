@@ -49,6 +49,7 @@ static NSString *const kDCLStorageEntryTitle = @"DCL 崩溃日志";
 @property (nonatomic, strong) UITextView *statusView;
 @property (nonatomic, strong) UISwitch *hookSwitch;
 @property (nonatomic, strong) UISwitch *masterSwitch;   ///< 总开关：开 = 停用插件（off 档）
+@property (nonatomic, strong) UISwitch *shakeSwitch;    ///< 摇一摇开关：开 = 启用摇一摇切换（默认开，防误触可关）
 @property (nonatomic, strong) UIButton *refreshButton;
 @property (nonatomic, strong) UIButton *exportButton;
 @property (nonatomic, strong) UIButton *clearButton;
@@ -381,6 +382,15 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
               forControlEvents:UIControlEventValueChanged];
     UIView *hookRow = [self switchRowWithTitle:@"方法交换（Hook）" control:self.hookSwitch];
 
+    // 摇一摇防误触开关：开 = 摇一摇切换档位（默认行为）/ 关 = 摇了没反应。
+    // 注意：关掉后如需重新开启，只能在本设置页操作（或改 capture_mode.txt）。
+    self.shakeSwitch = [[UISwitch alloc] init];
+    self.shakeSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.shakeSwitch addTarget:self
+                         action:@selector(onShakeChanged)
+               forControlEvents:UIControlEventValueChanged];
+    UIView *shakeRow = [self switchRowWithTitle:@"摇一摇切换（防误触可关）" control:self.shakeSwitch];
+
     self.refreshButton = [self makeButton:@"刷新 latest.log 快照"
                                    action:@selector(refreshSnapshot)];
     self.exportButton  = [self makeButton:@"导出日志目录"
@@ -389,7 +399,7 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
                                    action:@selector(clearLogs)];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        self.statusView, masterRow, hookRow, self.refreshButton,
+        self.statusView, masterRow, hookRow, shakeRow, self.refreshButton,
         self.exportButton, self.clearButton
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
@@ -461,6 +471,7 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
     BOOL hooksOn = [DCLConfig hooksEnabled];
     self.masterSwitch.on = off;
     self.hookSwitch.on = hooksOn;
+    self.shakeSwitch.on = [DCLConfig shakeEnabled];
     // 停用状态下 Hook 档位没有意义，置灰免得用户拨了半天发现没反应。
     self.hookSwitch.enabled = !off;
 
@@ -543,6 +554,30 @@ static NSArray *dcl_sectionDataArray(id self, SEL _cmd) {
     [alert addAction:[UIAlertAction actionWithTitle:@"知道了"
                                              style:UIAlertActionStyleDefault
                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+/// 摇一摇开关拨动：开 = 摇一摇切换档位 / 关 = 防误触（摇了没反应）。
+/// 即时生效，无需重启 —— 钩子本身保留透传，只是跳过摇动检测。
+/// 诚实告知：如果关掉后又切到了 off 档且没装 DYStorage，再想开回来只能改
+/// capture_mode.txt 文件（本设置页进不来的话）。
+- (void)onShakeChanged {
+    BOOL on = self.shakeSwitch.on;
+    [DCLConfig setShakeEnabled:on];
+    [self refreshStatus];
+
+    NSString *title = on ? @"摇一摇已启用" : @"摇一摇已关闭（防误触）";
+    NSString *msg = on
+        ? @"摇一摇可继续切换采集档位，立即生效。"
+        : @"摇一摇不再翻转档位。如需重新开启，请回本设置页打开；"
+          @"若已切到停用档且本页进不来，改 capture_mode.txt 文件也能开回来。";
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:title
+                                            message:msg
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 

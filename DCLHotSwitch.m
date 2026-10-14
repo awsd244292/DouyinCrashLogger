@@ -265,6 +265,10 @@ static void dcl_hs_sendEvent(id self, SEL _cmd, UIEvent *event) {
     // 铁律：先透传，绝不吞事件
     if (dcl_hs_orig_sendEvent) dcl_hs_orig_sendEvent(self, _cmd, event);
 
+    // 防误触开关：关掉后摇一摇不再翻转档位。钩子本身保留（透传零成本），
+    // 只是跳过检测 —— 比卸载重装钩子便宜，也避免和 PlaybackTracer 的链式透传打架。
+    if (![DCLConfig shakeEnabled]) return;
+
     @try {
         if (dcl_hs_is_shake(event)) {
             uint64_t now = DCLNowUs();
@@ -312,6 +316,10 @@ static void dcl_hs_sendEvent(id self, SEL _cmd, UIEvent *event) {
 + (NSString *)installStateDescription {
     if (dcl_hs_installed == 0) return @"未安装（尚未到延迟安装时机）";
     if (dcl_hs_install_succeeded == 0) return @"安装失败：宿主未提供可钩的事件入口";
+    if (![DCLConfig shakeEnabled]) {
+        return [NSString stringWithFormat:@"已安装：%@ sendEvent: 旁路监听（摇一摇已关闭·防误触）",
+                dcl_hs_install_target];
+    }
     return [NSString stringWithFormat:@"已安装：%@ sendEvent: 旁路监听（摇一摇翻转 safe/full）",
             dcl_hs_install_target];
 }
